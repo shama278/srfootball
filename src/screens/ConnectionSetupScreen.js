@@ -14,27 +14,23 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
-import {getDefaultWebSocketPort} from '../services/networkUtils';
+import {getDefaultWebSocketPort, getLocalIPAddress} from '../services/networkUtils';
 import WebSocketClient from '../services/websocketClient';
-import logger from '../services/logger';
-
-// Полифилл для Buffer в React Native
-if (typeof Buffer === 'undefined') {
-  global.Buffer = require('buffer').Buffer;
-}
 
 const CONTROLLER_IP_KEY = 'controller_ip_address';
 
 /**
  * Экран настройки подключения для контроллера (поиск табло)
  */
-const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isController = false, onShowLogs}) => {
+const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isController = false}) => {
   const [ipAddress, setIpAddress] = useState('');
   const [savedIp, setSavedIp] = useState('');
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [autoDiscovering, setAutoDiscovering] = useState(false);
   const [focusedInput, setFocusedInput] = useState(false);
+  const [foundDevices, setFoundDevices] = useState([]); // Список найденных устройств
+  const [deviceUpdateInterval, setDeviceUpdateInterval] = useState(null);
   const inputRef = useRef(null);
   const scanButtonRef = useRef(null);
   const connectButtonRef = useRef(null);
@@ -44,9 +40,22 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
     loadSavedIp();
     startAutoDiscovery();
 
+    // Обновляем список найденных устройств периодически
+    const interval = setInterval(() => {
+      if (discoveryService) {
+        const devices = discoveryService.getFoundDevices();
+        setFoundDevices(devices);
+      }
+    }, 1000);
+
+    setDeviceUpdateInterval(interval);
+
     return () => {
       if (discoveryService) {
-        discoveryService.stopListening();
+        discoveryService.stopBroadcast();
+      }
+      if (interval) {
+        clearInterval(interval);
       }
     };
   }, []);
@@ -59,7 +68,7 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         setIpAddress(saved);
       }
     } catch (error) {
-      logger.error('Ошибка при загрузке сохраненного IP:', error);
+      console.error('Ошибка при загрузке сохраненного IP:', error);
     }
   };
 
@@ -68,7 +77,7 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       await AsyncStorage.setItem(CONTROLLER_IP_KEY, ip);
       setSavedIp(ip);
     } catch (error) {
-      logger.error('Ошибка при сохранении IP:', error);
+      console.error('Ошибка при сохранении IP:', error);
     }
   }, []);
 
@@ -84,15 +93,22 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
     });
   };
 
-  const testConnection = async (ip, port) => {
-    return new Promise((resolve) => {
+  const testConnection = async (ip, port, timeoutMs = 500) => {
+    return new Promise(async (resolve) => {
       let testClient = null;
       let resolved = false;
 
       try {
-        testClient = new WebSocketClient(ip, port);
+        // Получаем локальный IP адрес для принудительного использования IPv4
+        const localIP = await getLocalIPAddress();
+        if (localIP) {
+          console.log(`[testConnection] Используем localAddress ${localIP} для IPv4`);
+        } else {
+          console.warn(`[testConnection] localAddress не получен, может использоваться IPv6`);
+        }
+        testClient = new WebSocketClient(ip, port, localIP || null);
       } catch (error) {
-        logger.error(`[testConnection] Ошибка при создании клиента для ${ip}:${port}:`, error.message || error.toString() || error);
+        console.error(`[testConnection] Ошибка при создании клиента для ${ip}:${port}:`, error);
         resolve(false);
         return;
       }
@@ -109,7 +125,7 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
           }
           resolve(false);
         }
-      }, 5000); // 5 секунд на проверку (увеличено для более надежного подключения)
+      }, timeoutMs); // Быстрая проверка (500ms по умолчанию)
 
       try {
         testClient.connect(
@@ -193,29 +209,34 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
 
     // Останавливаем discovery при ручном подключении
     if (discoveryService) {
-      discoveryService.stopListening();
+      discoveryService.stopBroadcast();
     }
 
     try {
-      // Тестируем подключение перед сохранением
+      // Тестируем подключение перед сохранением (быстрая проверка)
       const port = getDefaultWebSocketPort();
+      console.log(`[ConnectionSetup] Тестирование подключения к ${trimmedIp}:${port}...`);
       const isConnected = await testConnection(trimmedIp, port);
 
       if (isConnected) {
+        console.log(`[ConnectionSetup] Тест подключения успешен, сохраняем IP и подключаемся...`);
         await saveIp(trimmedIp);
+        // Останавливаем discovery перед подключением
+        if (discoveryService) {
+          discoveryService.stopBroadcast();
+        }
         onConnect(trimmedIp);
       } else {
-        const errorMessage = `Не удалось подключиться к табло ${trimmedIp}:${port}\n\nВозможные причины:\n- Неверный IP адрес\n- Табло не запущено\n- Устройства не в одной сети\n- Брандмауэр блокирует подключение\n\nПопробуйте:\n1. Проверить IP адрес табло в настройках Wi-Fi\n2. Убедиться что табло запущено\n3. Проверить что оба устройства в одной Wi-Fi сети\n4. Попробовать сканирование сети`;
-        Alert.alert('Ошибка подключения', errorMessage);
+        console.log(`[ConnectionSetup] Тест подключения не удался`);
+        Alert.alert('Ошибка', `Не удалось подключиться к табло ${trimmedIp}:${port}\n\nПроверьте:\n- Правильность IP адреса\n- Что табло запущено\n- Что устройства в одной сети`);
         // Перезапускаем discovery если подключение не удалось
         if (discoveryService) {
           startAutoDiscovery();
         }
       }
     } catch (error) {
-      logger.error('Ошибка при подключении:', error);
-      const errorMessage = error.message || error.toString();
-      Alert.alert('Ошибка подключения', `Не удалось подключиться к табло:\n${errorMessage}\n\nПроверьте:\n- Правильность IP адреса\n- Что табло запущено\n- Что устройства в одной сети`);
+      console.error('[ConnectionSetup] Ошибка при подключении:', error);
+      Alert.alert('Ошибка', 'Не удалось подключиться к табло');
       // Перезапускаем discovery если подключение не удалось
       if (discoveryService) {
         startAutoDiscovery();
@@ -229,14 +250,11 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
     setScanning(true);
     try {
       const state = await NetInfo.fetch();
-
-      // Не блокируем сканирование даже если NetInfo считает что нет подключения
-      // Это важно для работы при раздаче Wi-Fi с телефона
-      // if (!state.isConnected) {
-      //   Alert.alert('Ошибка', 'Нет подключения к сети');
-      //   setScanning(false);
-      //   return;
-      // }
+      if (!state.isConnected) {
+        Alert.alert('Ошибка', 'Нет подключения к сети');
+        setScanning(false);
+        return;
+      }
 
       // Получаем IP адрес текущего устройства
       let currentIp = null;
@@ -251,74 +269,10 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         }
       }
 
-      // Если не удалось получить IP из NetInfo, пробуем стандартные диапазоны
       if (!currentIp) {
-        // При раздаче Wi-Fi с телефона часто используется диапазон 192.168.43.x
-        // или 192.168.137.x, или другие стандартные диапазоны
-        logger.log('[Scan] Не удалось определить IP из NetInfo, пробуем стандартные диапазоны');
-
-        // Пробуем сканировать стандартные диапазоны
-        const commonRanges = [
-          '192.168.43',  // Android Hotspot
-          '192.168.137', // Windows Mobile Hotspot
-          '192.168.1',   // Обычная домашняя сеть
-          '192.168.0',   // Обычная домашняя сеть
-          '10.0.0',      // Корпоративная сеть
-        ];
-
-        let foundController = null;
-
-        for (const baseIp of commonRanges) {
-          const port = getDefaultWebSocketPort();
-          const testIps = [];
-
-          // Проверяем только наиболее вероятные адреса в каждом диапазоне
-          // Используем те же приоритетные диапазоны
-          const priorityRanges = [
-            { start: 1, end: 20 },
-            { start: 100, end: 120 },
-            { start: 200, end: 220 },
-          ];
-          
-          priorityRanges.forEach((range) => {
-            for (let i = range.start; i <= range.end; i++) {
-              testIps.push(`${baseIp}.${i}`);
-            }
-          });
-
-          logger.log(`[Scan] Сканирование диапазона ${baseIp}.x`);
-
-          for (const testIp of testIps) {
-            try {
-              logger.log(`[Scan] Проверка ${testIp}:${port}`);
-              const isConnected = await testConnection(testIp, port);
-              if (isConnected) {
-                foundController = testIp;
-                break;
-              }
-              // Небольшая задержка между проверками
-              await new Promise(resolve => setTimeout(resolve, 100));
-            } catch (error) {
-              logger.error(`[Scan] Ошибка при проверке ${testIp}:`, error);
-              continue;
-            }
-          }
-
-          if (foundController) {
-            break;
-          }
-        }
-
-        if (foundController) {
-          setIpAddress(foundController);
-          Alert.alert('Табло найдено!', `Найдено табло по адресу:\n${foundController}\n\nНажмите "Подключиться" для соединения.`);
-          setScanning(false);
-          return;
-        } else {
-          Alert.alert('Информация', 'Не удалось определить IP адрес и найти табло автоматически. Введите IP вручную.');
-          setScanning(false);
-          return;
-        }
+        Alert.alert('Информация', 'Не удалось определить IP адрес. Введите IP вручную.');
+        setScanning(false);
+        return;
       }
 
       // Проверяем формат IP адреса
@@ -340,88 +294,59 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       const baseIp = `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}`;
       const port = getDefaultWebSocketPort();
 
-      // Генерируем список возможных IP адресов для проверки
-      const possibleIps = [];
+      // Приоритетные IP адреса для быстрой проверки (обычно роутеры, популярные адреса)
+      const priorityIps = [
+        `${baseIp}.1`,   // Обычно роутер
+        `${baseIp}.2`,
+        `${baseIp}.100`,
+        `${baseIp}.101`,
+        `${baseIp}.254`, // Часто используется
+      ].filter(ip => ip !== currentIp); // Убираем свой IP
 
-      // Добавляем IP адреса в диапазоне от 1 до 254
-      for (let i = 1; i <= 254; i++) {
-        if (i.toString() !== ipParts[3]) { // Пропускаем свой IP
-          possibleIps.push(`${baseIp}.${i}`);
+      // Дополнительные IP для проверки (первые 30 адресов, но не приоритетные)
+      const additionalIps = [];
+      for (let i = 1; i <= 30; i++) {
+        const testIp = `${baseIp}.${i}`;
+        if (testIp !== currentIp && !priorityIps.includes(testIp)) {
+          additionalIps.push(testIp);
         }
       }
 
-      // Умное сканирование: проверяем только наиболее вероятные адреса
-      // Используем параллельные запросы для ускорения
-      const priorityRanges = [
-        // Стандартные диапазоны роутеров и устройств
-        { start: 1, end: 20 },      // Обычно роутеры и первые устройства
-        { start: 100, end: 120 },   // Средний диапазон
-        { start: 200, end: 220 },   // Высокий диапазон
-      ];
-
-      const testIps = [];
-      priorityRanges.forEach((range) => {
-        for (let i = range.start; i <= range.end; i++) {
-          const ip = `${baseIp}.${i}`;
-          // Пропускаем свой IP
-          if (ip !== currentIp) {
-            testIps.push(ip);
-          }
-        }
-      });
-
-      // Если текущий IP не в приоритетных диапазонах, добавляем его соседей
-      const currentLastOctet = parseInt(ipParts[3], 10);
-      if (currentLastOctet < 1 || currentLastOctet > 220) {
-        // Добавляем соседние адреса текущего IP
-        for (let i = Math.max(1, currentLastOctet - 5); i <= Math.min(254, currentLastOctet + 5); i++) {
-          if (i !== currentLastOctet) {
-            const ip = `${baseIp}.${i}`;
-            if (!testIps.includes(ip)) {
-              testIps.push(ip);
-            }
-          }
-        }
-      }
-
+      // Объединяем: сначала приоритетные, потом дополнительные
+      const testIps = [...priorityIps, ...additionalIps];
       let foundController = null;
-      let checkedCount = 0;
-      const maxConcurrent = 10; // Максимум параллельных запросов
 
-      Alert.alert('Поиск табло', `Идет сканирование сети...\nПроверяется ${testIps.length} наиболее вероятных адресов.`);
+      Alert.alert('Поиск табло', 'Идет быстрое сканирование сети...');
 
-      // Параллельное сканирование с ограничением количества одновременных запросов
-      for (let i = 0; i < testIps.length; i += maxConcurrent) {
-        const batch = testIps.slice(i, i + maxConcurrent);
-        const results = await Promise.allSettled(
+      // Параллельное сканирование нескольких адресов одновременно (батчами по 5)
+      const batchSize = 5;
+      for (let i = 0; i < testIps.length; i += batchSize) {
+        const batch = testIps.slice(i, i + batchSize);
+
+        // Проверяем батч параллельно
+        const results = await Promise.all(
           batch.map(async (testIp) => {
             try {
-              checkedCount++;
-              logger.log(`[Scan] Проверка ${testIp}:${port} (${checkedCount}/${testIps.length})`);
-              const isConnected = await testConnection(testIp, port);
-              return { ip: testIp, connected: isConnected };
+              console.log(`[Scan] Проверка ${testIp}:${port}`);
+              const isConnected = await testConnection(testIp, port, 800); // 800ms на проверку
+              return isConnected ? testIp : null;
             } catch (error) {
-              logger.error(`[Scan] Ошибка при проверке ${testIp}:`, error);
-              return { ip: testIp, connected: false };
+              console.error(`[Scan] Ошибка при проверке ${testIp}:`, error);
+              return null;
             }
           })
         );
 
         // Проверяем результаты
-        for (const result of results) {
-          if (result.status === 'fulfilled' && result.value.connected) {
-            foundController = result.value.ip;
-            break;
-          }
+        const found = results.find(result => result !== null);
+        if (found) {
+          foundController = found;
+          break; // Нашли, прекращаем поиск
         }
 
-        if (foundController) {
-          break;
-        }
-
-        // Небольшая задержка между батчами
-        if (i + maxConcurrent < testIps.length) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+        // Небольшая пауза между батчами
+        if (i + batchSize < testIps.length) {
+          await new Promise(resolve => setTimeout(resolve, 50));
         }
       }
 
@@ -431,11 +356,11 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       } else {
         Alert.alert(
           'Табло не найдено',
-          `Проверено ${checkedCount} адресов в сети ${baseIp}.x\n\nПопробуйте:\n1. Убедиться, что табло запущено\n2. Ввести IP адрес вручную\n3. Проверить, что устройства в одной сети\n4. Использовать автоматическое обнаружение (если доступно)`
+          `Проверено ${testIps.length} адресов в сети.\n\nПопробуйте:\n1. Убедиться, что табло запущено\n2. Ввести IP адрес вручную\n3. Проверить, что устройства в одной сети`
         );
       }
     } catch (error) {
-      logger.error('Ошибка при сканировании сети:', error);
+      console.error('Ошибка при сканировании сети:', error);
       Alert.alert('Ошибка', `Не удалось просканировать сеть: ${error.message || error.toString()}`);
     } finally {
       setScanning(false);
@@ -451,46 +376,96 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
   };
 
   /**
-   * Запускает автоматическое обнаружение контроллера через UDP broadcast
+   * Запускает автоматическое обнаружение устройств через UDP broadcast
    */
   const startAutoDiscovery = useCallback(async () => {
     if (!discoveryService) {
-      logger.log('[ConnectionSetup] DiscoveryService не доступен');
       return;
     }
 
     setAutoDiscovering(true);
     try {
-      // Не проверяем состояние сети через NetInfo, так как это может блокировать
-      // работу при раздаче Wi-Fi с телефона
-      await discoveryService.startListening((foundIp, foundPort) => {
-        logger.log(`[ConnectionSetup] Автоматически найдено табло: ${foundIp}:${foundPort}`);
-        setIpAddress(foundIp);
-        setAutoDiscovering(false);
+      await discoveryService.startBroadcast((foundIp, foundPort, deviceName) => {
+        console.log(`[ConnectionSetup] ========================================`);
+        console.log(`[ConnectionSetup] ПОЛУЧЕН КОЛБЭК: ТАБЛО НАЙДЕНО!`);
+        console.log(`[ConnectionSetup] IP адрес: ${foundIp}`);
+        console.log(`[ConnectionSetup] Порт: ${foundPort}`);
+        console.log(`[ConnectionSetup] Имя устройства: ${deviceName || 'Unknown Device'}`);
+        console.log(`[ConnectionSetup] Полный адрес: ${foundIp}:${foundPort}`);
+        console.log(`[ConnectionSetup] ========================================`);
+        console.log(`[ConnectionSetup] Найдено табло: ${deviceName || 'Unknown'} на ${foundIp}:${foundPort}`);
 
-        // Автоматически подключаемся через небольшую задержку
-        setTimeout(async () => {
-          const trimmedIp = foundIp.trim();
-          if (trimmedIp) {
-            try {
-              await saveIp(trimmedIp);
-              onConnect(trimmedIp);
-            } catch (error) {
-              logger.error('[ConnectionSetup] Ошибка при сохранении IP:', error);
-              onConnect(trimmedIp); // Подключаемся даже если сохранение не удалось
+        // Обновляем список найденных устройств
+        const devices = discoveryService.getFoundDevices();
+        setFoundDevices(devices);
+
+        // Автоматически подключаемся к первому найденному устройству через небольшую задержку
+        // (только если еще не подключены)
+        if (!loading && foundIp) {
+          setTimeout(async () => {
+            const trimmedIp = foundIp.trim();
+            if (trimmedIp && !ipAddress) {
+              setIpAddress(trimmedIp);
+              // Не подключаемся автоматически - даем пользователю выбрать устройство
             }
-          }
-        }, 500);
+          }, 500);
+        }
       });
 
-      logger.log('[ConnectionSetup] Автоматическое обнаружение запущено');
+      console.log('[ConnectionSetup] Автоматическое обнаружение запущено (контроллер ищет табло)');
     } catch (error) {
-      logger.error('[ConnectionSetup] Ошибка при запуске автоматического обнаружения:', error);
+      console.error('[ConnectionSetup] Ошибка при запуске автоматического обнаружения:', error);
       setAutoDiscovering(false);
-      // Не показываем ошибку пользователю, так как это может быть нормально
-      // при раздаче Wi-Fi с телефона или других особых случаях
     }
-  }, [discoveryService, onConnect, saveIp]);
+  }, [discoveryService, loading, ipAddress]);
+
+  /**
+   * Подключается к выбранному устройству
+   */
+  const handleDeviceSelect = useCallback(async (device) => {
+    const trimmedIp = device.ip.trim();
+    if (!trimmedIp) {
+      Alert.alert('Ошибка', 'Неверный IP адрес устройства');
+      return;
+    }
+
+    setLoading(true);
+    setAutoDiscovering(false);
+
+    // Останавливаем discovery при ручном подключении
+    if (discoveryService) {
+      discoveryService.stopBroadcast();
+    }
+
+    try {
+      // Тестируем подключение перед сохранением
+      const port = device.port || getDefaultWebSocketPort();
+      const isConnected = await testConnection(trimmedIp, port);
+
+      if (isConnected) {
+        await saveIp(trimmedIp);
+        onConnect(trimmedIp);
+      } else {
+        Alert.alert(
+          'Ошибка',
+          `Не удалось подключиться к устройству ${trimmedIp}:${port}\n\nПроверьте:\n- Правильность IP адреса\n- Что устройство запущено\n- Что устройства в одной сети`
+        );
+        // Перезапускаем discovery если подключение не удалось
+        if (discoveryService) {
+          startAutoDiscovery();
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка при подключении:', error);
+      Alert.alert('Ошибка', 'Не удалось подключиться к устройству');
+      // Перезапускаем discovery если подключение не удалось
+      if (discoveryService) {
+        startAutoDiscovery();
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [discoveryService, onConnect, saveIp, startAutoDiscovery]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -507,24 +482,40 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
 
           {autoDiscovering && (
             <View style={styles.autoDiscoveryContainer}>
-              <View style={styles.autoDiscoveryContent}>
-                <ActivityIndicator size="small" color="#2196f3" style={styles.autoDiscoverySpinner} />
-                <Text style={styles.autoDiscoveryText}>
-                  🔍 Автоматический поиск табло...
-                </Text>
-              </View>
-              <TouchableOpacity
-                style={styles.stopDiscoveryButton}
-                onPress={() => {
-                  if (discoveryService) {
-                    discoveryService.stopListening();
-                  }
-                  setAutoDiscovering(false);
-                  logger.log('[ConnectionSetup] Автоматический поиск остановлен пользователем');
-                }}
-                activeOpacity={0.7}>
-                <Text style={styles.stopDiscoveryButtonText}>Остановить</Text>
-              </TouchableOpacity>
+              <ActivityIndicator size="small" color="#2196f3" style={styles.autoDiscoverySpinner} />
+              <Text style={styles.autoDiscoveryText}>
+                🔍 Автоматический поиск устройств в сети...
+              </Text>
+            </View>
+          )}
+
+          {/* Список найденных устройств */}
+          {foundDevices.length > 0 && (
+            <View style={styles.devicesContainer}>
+              <Text style={styles.devicesTitle}>Найденные устройства ({foundDevices.length}):</Text>
+              <ScrollView style={styles.devicesList} nestedScrollEnabled={true}>
+                {foundDevices.map((device, index) => (
+                  <TouchableOpacity
+                    key={`${device.ip}:${device.port}`}
+                    style={[
+                      styles.deviceItem,
+                      ipAddress === device.ip && styles.deviceItemSelected,
+                    ]}
+                    onPress={() => handleDeviceSelect(device)}
+                    disabled={loading || scanning}
+                    activeOpacity={0.7}>
+                    <View style={styles.deviceInfo}>
+                      <Text style={styles.deviceName}>{device.deviceName || 'Unknown Device'}</Text>
+                      <Text style={styles.deviceAddress}>{device.ip}:{device.port}</Text>
+                    </View>
+                    {ipAddress === device.ip && (
+                      <View style={styles.deviceSelectedIndicator}>
+                        <Text style={styles.deviceSelectedText}>✓</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
             </View>
           )}
 
@@ -538,9 +529,9 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
               ]}
               value={ipAddress}
               onChangeText={setIpAddress}
-              placeholder="192.168.18.36"
+              placeholder="192.168.0.217"
               placeholderTextColor="#999"
-              keyboardType="numeric"
+              keyboardType="default"
               autoCapitalize="none"
               autoCorrect={false}
               editable={!loading && !scanning}
@@ -628,15 +619,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
               )}
             </TouchableOpacity>
           </View>
-
-          {onShowLogs && (
-            <TouchableOpacity
-              style={styles.logsButton}
-              onPress={onShowLogs}
-              activeOpacity={0.7}>
-              <Text style={styles.logsButtonText}>📋 Показать логи</Text>
-            </TouchableOpacity>
-          )}
 
           <View style={styles.infoContainer}>
             <Text style={styles.infoTitle}>Автоматическое подключение:</Text>
@@ -792,18 +774,15 @@ const styles = StyleSheet.create({
     fontStyle: 'italic',
   },
   autoDiscoveryContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: '#e3f2fd',
     padding: 15,
     borderRadius: 8,
     marginBottom: 20,
     borderLeftWidth: 4,
     borderLeftColor: '#2196f3',
-  },
-  autoDiscoveryContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 10,
   },
   autoDiscoverySpinner: {
     marginRight: 10,
@@ -813,31 +792,63 @@ const styles = StyleSheet.create({
     color: '#1976d2',
     fontWeight: '500',
   },
-  stopDiscoveryButton: {
-    paddingHorizontal: 15,
-    paddingVertical: 8,
-    backgroundColor: '#f44336',
-    borderRadius: 6,
-    alignSelf: 'center',
-  },
-  stopDiscoveryButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  logsButton: {
-    marginTop: 15,
-    paddingVertical: 15,
-    paddingHorizontal: 30,
-    borderRadius: 8,
-    backgroundColor: '#2196f3',
-    alignItems: 'center',
+  devicesContainer: {
     marginBottom: 20,
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    padding: 15,
+    maxHeight: 200,
   },
-  logsButtonText: {
-    fontSize: 16,
+  devicesTitle: {
+    fontSize: Platform.isTV ? 18 : 16,
     fontWeight: '600',
+    color: '#333',
+    marginBottom: 10,
+  },
+  devicesList: {
+    maxHeight: 150,
+  },
+  deviceItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 12,
+    marginBottom: 8,
+    backgroundColor: '#f5f5f5',
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#ddd',
+  },
+  deviceItemSelected: {
+    borderColor: '#2196f3',
+    backgroundColor: '#e3f2fd',
+  },
+  deviceInfo: {
+    flex: 1,
+  },
+  deviceName: {
+    fontSize: Platform.isTV ? 18 : 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 4,
+  },
+  deviceAddress: {
+    fontSize: Platform.isTV ? 16 : 14,
+    color: '#666',
+  },
+  deviceSelectedIndicator: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#4caf50',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 10,
+  },
+  deviceSelectedText: {
     color: '#ffffff',
+    fontSize: 16,
+    fontWeight: 'bold',
   },
 });
 

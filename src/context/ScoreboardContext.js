@@ -1,6 +1,5 @@
 import React, {createContext, useContext, useState, useEffect, useCallback, useRef} from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import logger from '../services/logger';
 
 /**
  * Начальное состояние табло
@@ -59,17 +58,58 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
     // Обновляем статус подключения для табло на основе количества подключенных контроллеров
     if (!isController && websocketServer) {
       const updateConnectionStatus = () => {
-        const clientCount = websocketServer.getClientCount();
-        setIsConnected(clientCount > 0);
+        if (websocketServer) {
+          const clientCount = websocketServer.getClientCount();
+          const isNowConnected = clientCount > 0;
+          setIsConnected(isNowConnected);
+          console.log(`[ScoreboardContext] Статус подключения обновлен: ${isNowConnected ? 'подключено' : 'не подключено'} (клиентов: ${clientCount})`);
+        } else {
+          setIsConnected(false);
+        }
+      };
+
+      // Сохраняем оригинальные колбэки
+      const originalOnConnection = websocketServer.onConnectionCallback;
+      const originalOnDisconnect = websocketServer.onDisconnectCallback;
+
+      // Обновляем колбэки, чтобы сразу обновлять статус при подключении/отключении
+      websocketServer.onConnectionCallback = (socketId) => {
+        if (originalOnConnection) {
+          try {
+            originalOnConnection(socketId);
+          } catch (error) {
+            console.error('[ScoreboardContext] Ошибка в оригинальном onConnectionCallback:', error);
+          }
+        }
+        // Немедленно обновляем статус
+        updateConnectionStatus();
+      };
+
+      websocketServer.onDisconnectCallback = (socketId) => {
+        if (originalOnDisconnect) {
+          try {
+            originalOnDisconnect(socketId);
+          } catch (error) {
+            console.error('[ScoreboardContext] Ошибка в оригинальном onDisconnectCallback:', error);
+          }
+        }
+        // Немедленно обновляем статус
+        updateConnectionStatus();
       };
 
       // Проверяем статус сразу
       updateConnectionStatus();
 
-      // Проверяем статус периодически (каждые 2 секунды)
-      const interval = setInterval(updateConnectionStatus, 2000);
+      // Также проверяем статус периодически (каждую секунду) для надежности
+      const interval = setInterval(updateConnectionStatus, 1000);
 
-      return () => clearInterval(interval);
+      return () => {
+        clearInterval(interval);
+        // Восстанавливаем оригинальные колбэки при размонтировании (если нужно)
+      };
+    } else if (!isController && !websocketServer) {
+      // Если сервер не существует, точно не подключено
+      setIsConnected(false);
     }
   }, [websocketServer, isController]);
 
@@ -86,7 +126,7 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
         return parsed;
       }
     } catch (error) {
-      logger.error('Ошибка при загрузке состояния:', error);
+      console.error('Ошибка при загрузке состояния:', error);
     }
     return null;
   }, []);
@@ -98,7 +138,7 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
     try {
       await AsyncStorage.setItem('scoreboardState', JSON.stringify(newState));
     } catch (error) {
-      logger.error('Ошибка при сохранении состояния:', error);
+      console.error('Ошибка при сохранении состояния:', error);
     }
   }, []);
 
@@ -107,20 +147,19 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
    */
   const broadcastUpdate = useCallback((update) => {
     if (isController && websocketClientRef.current) {
-      try {
-        // Проверяем состояние соединения перед отправкой
-        if (websocketClientRef.current.getIsConnected && websocketClientRef.current.getIsConnected()) {
+      // Проверяем, что подключение установлено перед отправкой
+      if (websocketClientRef.current.getIsConnected && websocketClientRef.current.getIsConnected()) {
+        try {
           websocketClientRef.current.send({
             type: 'scoreboard_update',
             data: update,
           });
-        } else {
-          logger.warn('[ScoreboardContext] Попытка отправить обновление без активного соединения');
+        } catch (error) {
+          console.error('Ошибка при отправке обновления:', error);
         }
-      } catch (error) {
-        logger.error('Ошибка при отправке обновления:', error);
-        // При ошибке отправки сбрасываем статус подключения
-        setIsConnected(false);
+      } else {
+        // Подключение еще не установлено, просто логируем (не ошибка)
+        console.log('[ScoreboardContext] Пропущена отправка обновления - подключение еще не установлено');
       }
     }
   }, [isController]);
@@ -392,22 +431,40 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
           try {
             // Вызываем оригинальный обработчик
             if (originalOnMessage) {
-              originalOnMessage(socketId, message);
+              try {
+                originalOnMessage(socketId, message);
+              } catch (originalError) {
+                console.error('[ScoreboardContext] Ошибка в оригинальном обработчике сообщений:', originalError);
+              }
             }
 
             // Обрабатываем обновления состояния от контроллера
-            if (message && message.type === 'scoreboard_update' && message.data) {
-              setState((prev) => {
-                const newState = {...prev, ...message.data};
-                return newState;
-              });
+            if (message && typeof message === 'object' && message.type === 'scoreboard_update' && message.data) {
+              try {
+                setState((prev) => {
+                  try {
+                    // Проверяем, что данные валидны перед обновлением состояния
+                    if (message.data && typeof message.data === 'object') {
+                      const newState = {...prev, ...message.data};
+                      return newState;
+                    }
+                    return prev;
+                  } catch (stateError) {
+                    console.error('[ScoreboardContext] Ошибка при обновлении состояния:', stateError);
+                    return prev;
+                  }
+                });
+              } catch (setStateError) {
+                console.error('[ScoreboardContext] Ошибка при вызове setState:', setStateError);
+              }
             }
           } catch (error) {
-            logger.error('[ScoreboardContext] Ошибка при обработке сообщения:', error);
+            console.error('[ScoreboardContext] Ошибка при обработке сообщения:', error);
+            // Не пробрасываем ошибку дальше, чтобы не крашить приложение
           }
         };
       } catch (error) {
-        logger.error('[ScoreboardContext] Ошибка при установке обработчика сообщений:', error);
+        console.error('[ScoreboardContext] Ошибка при установке обработчика сообщений:', error);
       }
     }
   }, [websocketServer, isController]);
@@ -417,39 +474,63 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
    */
   useEffect(() => {
     if (isController && websocketClientRef.current) {
-      const handleOpen = () => {
-        logger.log('[ScoreboardContext] Контроллер подключен к табло');
-        setIsConnected(true);
-      };
+      // Проверяем, не подключены ли уже
+      if (websocketClientRef.current.getIsConnected()) {
+        console.log('[ScoreboardContext] Уже подключен, пропускаем повторное подключение');
+        return;
+      }
 
-      const handleMessage = (message) => {
-        // Контроллер может получать сообщения от табло (если нужно)
-        logger.log('[ScoreboardContext] Сообщение от табло:', message);
-      };
+      // Задержка не требуется для обычного режима
+      const connectDelay = 0;
 
-      const handleError = (error) => {
-        const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-        logger.error('[ScoreboardContext] Ошибка WebSocket:', errorMsg);
-        setIsConnected(false);
-      };
+      const connectTimeout = setTimeout(() => {
+        // Проверяем еще раз перед подключением
+        if (!websocketClientRef.current || websocketClientRef.current.getIsConnected()) {
+          console.log('[ScoreboardContext] Клиент уже подключен или не существует, пропускаем');
+          return;
+        }
 
-      const handleClose = () => {
-        logger.log('[ScoreboardContext] Отключен от табло');
-        setIsConnected(false);
-      };
+        const handleOpen = () => {
+          console.log('[ScoreboardContext] Контроллер подключен к табло');
+          setIsConnected(true);
+        };
 
-      // Подключаем обработчики
-      websocketClientRef.current.connect(handleOpen, handleMessage, handleError, handleClose).catch((error) => {
-        logger.error('[ScoreboardContext] Ошибка при подключении к табло:', error);
-      });
+        const handleMessage = (message) => {
+          // Контроллер может получать сообщения от табло (если нужно)
+          console.log('[ScoreboardContext] Сообщение от табло:', message);
+        };
+
+        const handleError = (error) => {
+          console.error('[ScoreboardContext] Ошибка WebSocket:', error);
+          setIsConnected(false);
+
+        };
+
+        const handleClose = () => {
+          console.log('[ScoreboardContext] Отключен от табло');
+          setIsConnected(false);
+        };
+
+        // Подключаем обработчики
+        if (websocketClientRef.current && !websocketClientRef.current.getIsConnected()) {
+          console.log('[ScoreboardContext] Начинаем подключение к табло...');
+          websocketClientRef.current.connect(handleOpen, handleMessage, handleError, handleClose).catch((error) => {
+            console.error('[ScoreboardContext] Ошибка при подключении к табло:', error);
+          });
+        } else {
+          console.log('[ScoreboardContext] Клиент уже подключен, пропускаем');
+        }
+      }, connectDelay);
 
       return () => {
-        if (websocketClientRef.current) {
-          websocketClientRef.current.disconnect();
-        }
+        clearTimeout(connectTimeout);
+        // Не отключаем клиент при размонтировании, так как он может использоваться повторно
+        // if (websocketClientRef.current) {
+        //   websocketClientRef.current.disconnect();
+        // }
       };
     }
-  }, [isController]);
+  }, [isController, websocketClient]);
 
   /**
    * Загрузка состояния при монтировании (для контроллера)

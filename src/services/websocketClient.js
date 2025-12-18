@@ -1,10 +1,5 @@
 import TcpSocket from 'react-native-tcp-socket';
-import logger from './logger';
-
-// Полифилл для Buffer в React Native
-if (typeof Buffer === 'undefined') {
-  global.Buffer = require('buffer').Buffer;
-}
+import {Buffer} from 'buffer';
 
 /**
  * Генерирует случайный ключ для WebSocket handshake
@@ -157,10 +152,17 @@ const parseHandshakeResponse = (response, expectedKey) => {
 };
 
 class WebSocketClient {
-  constructor(host, port = 8080) {
+  constructor(host, port = 8080, localAddress = null) {
     this.host = host;
     this.port = port;
+    this.localAddress = localAddress; // Локальный IPv4 адрес для принудительного использования IPv4
     this.socket = null;
+
+    if (localAddress) {
+      console.log(`[WebSocket Client] Конструктор: localAddress установлен в ${localAddress}`);
+    } else {
+      console.warn(`[WebSocket Client] Конструктор: localAddress НЕ установлен!`);
+    }
     this.isConnected = false;
     this.isHandshakeComplete = false;
     this.buffer = Buffer.alloc(0);
@@ -174,6 +176,11 @@ class WebSocketClient {
     this.maxReconnectAttempts = 5;
     this.reconnectDelay = 3000;
     this.reconnectTimer = null;
+    this.heartbeatInterval = null;
+    this.heartbeatTimeout = null;
+    this.heartbeatIntervalMs = 30000; // 30 секунд
+    this.heartbeatTimeoutMs = 10000; // 10 секунд таймаут на ответ
+    this.lastPongTime = null;
   }
 
   /**
@@ -325,7 +332,7 @@ class WebSocketClient {
    */
   async connect(onOpen, onMessage, onError, onClose) {
     if (this.isConnected) {
-      logger.warn('[WebSocket Client] Уже подключен');
+      console.warn('[WebSocket Client] Уже подключен');
       return;
     }
 
@@ -340,34 +347,53 @@ class WebSocketClient {
         this.webSocketKey = generateWebSocketKey();
         this.expectedAcceptKey = null;
 
-        // Таймаут для подключения (10 секунд)
+        // Таймаут на подключение
         const connectionTimeout = setTimeout(() => {
-          if (this.socket && !this.isConnected) {
-            logger.error('[WebSocket Client] Таймаут подключения');
-            try {
-              this.socket.destroy();
-            } catch (e) {
-              // Игнорируем ошибки при закрытии
-            }
-            const timeoutError = new Error(`Таймаут подключения к ${this.host}:${this.port}. Проверьте IP адрес и что табло запущено.`);
+          if (!this.isConnected) {
+            const timeoutError = new Error(`Таймаут подключения к ${this.host}:${this.port} (превышено 10 секунд)`);
+            console.error('[WebSocket Client]', timeoutError.message);
             this.handleError(timeoutError);
+            if (this.socket) {
+              try {
+                this.socket.destroy();
+              } catch (e) {
+                // Игнорируем ошибки при закрытии
+              }
+            }
             reject(timeoutError);
           }
-        }, 10000);
+        }, 10000); // 10 секунд таймаут
 
         // Вычисляем ожидаемый accept key
         this.calculateAcceptKey(this.webSocketKey).then((acceptKey) => {
           this.expectedAcceptKey = acceptKey;
 
           // Создаем TCP соединение
+          // Используем localAddress для принудительного использования IPv4
+          // Это решает проблему ECONNREFUSED при подключении к внешним IP адресам на Android
+          // host - это IP табло (куда подключаемся)
+          // localAddress - это IP контроллера (откуда подключаемся)
+          const connectionOptions = {
+            port: this.port,
+            host: this.host, // IP табло (сервер)
+          };
+
+          // Если указан localAddress, используем его для принудительного IPv4
+          // localAddress - это IP контроллера (клиент)
+          if (this.localAddress) {
+            connectionOptions.localAddress = this.localAddress;
+            console.log(`[WebSocket Client] Подключение: TO ${this.host}:${this.port} FROM ${this.localAddress}`);
+            console.log(`[WebSocket Client] connectionOptions:`, JSON.stringify(connectionOptions));
+          } else {
+            console.warn(`[WebSocket Client] localAddress не указан! Может использоваться IPv6`);
+            console.log(`[WebSocket Client] Подключение: TO ${this.host}:${this.port} FROM (автоматически)`);
+          }
+
           this.socket = TcpSocket.createConnection(
-            {
-              port: this.port,
-              host: this.host,
-            },
+            connectionOptions,
             () => {
               clearTimeout(connectionTimeout);
-              logger.log(`[WebSocket Client] TCP соединение установлено с ${this.host}:${this.port}`);
+              console.log(`[WebSocket Client] TCP соединение установлено с ${this.host}:${this.port}`);
 
               // Отправляем WebSocket handshake
               const handshake = [
@@ -382,72 +408,43 @@ class WebSocketClient {
               ].join('\r\n');
 
               this.socket.write(handshake);
-              logger.log('[WebSocket Client] Handshake отправлен');
+              console.log('[WebSocket Client] Handshake отправлен');
             }
           );
 
           this.socket.on('data', (data) => {
-            try {
-              this.handleData(data);
-            } catch (error) {
-              const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-              logger.error('[WebSocket Client] Ошибка при обработке данных:', errorMsg);
-              // Не закрываем соединение при ошибке обработки данных
-            }
+            this.handleData(data);
           });
 
           this.socket.on('error', (error) => {
             clearTimeout(connectionTimeout);
             const errorMessage = error.message || error.toString();
-            logger.error(`[WebSocket Client] Ошибка сокета при подключении к ${this.host}:${this.port}:`, errorMessage);
-
-            // Сбрасываем состояние соединения при ошибке
-            this.isConnected = false;
-            this.isHandshakeComplete = false;
-
-            // Более информативное сообщение об ошибке
-            let userFriendlyError = errorMessage;
-            if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('connection refused')) {
-              userFriendlyError = `Не удалось подключиться к ${this.host}:${this.port}. Табло не запущено или неверный IP адрес.`;
-            } else if (errorMessage.includes('ENETUNREACH') || errorMessage.includes('network unreachable') || errorMessage.includes('Host unreachable')) {
-              userFriendlyError = `Сеть недоступна. Проверьте что устройства в одной Wi-Fi сети.`;
-            } else if (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('timeout') || errorMessage.includes('connection time out')) {
-              userFriendlyError = `Таймаут подключения. Проверьте IP адрес и что табло запущено.`;
-            } else if (errorMessage.includes('Broken pipe') || errorMessage.includes('Connection reset')) {
-              userFriendlyError = `Соединение разорвано. Возможно, табло закрыло соединение. Проверьте настройки табло.`;
-            }
-
-            const enhancedError = new Error(userFriendlyError);
-            this.handleError(enhancedError);
-            reject(enhancedError);
+            console.error('[WebSocket Client] Ошибка сокета:', errorMessage);
+            console.error('[WebSocket Client] Детали ошибки:', {
+              code: error.code,
+              errno: error.errno,
+              syscall: error.syscall,
+              address: error.address,
+              port: error.port,
+            });
+            this.handleError(error);
+            reject(error);
           });
 
           this.socket.on('close', () => {
             clearTimeout(connectionTimeout);
-            logger.log('[WebSocket Client] Соединение закрыто');
-            // Сбрасываем состояние соединения
-            const wasConnected = this.isConnected;
-            this.isConnected = false;
-            this.isHandshakeComplete = false;
-            // Вызываем handleClose только если соединение было установлено
-            if (wasConnected) {
-              this.handleClose();
-            } else {
-              // Если соединение закрылось до завершения handshake, это ошибка
-              const closeError = new Error('Соединение закрыто до завершения handshake');
-              this.handleError(closeError);
-            }
+            console.log('[WebSocket Client] Соединение закрыто');
+            this.handleClose();
           });
 
           resolve();
         }).catch((error) => {
           clearTimeout(connectionTimeout);
-          logger.error('[WebSocket Client] Ошибка при вычислении accept key:', error);
-          this.handleError(error);
+          console.error('[WebSocket Client] Ошибка при вычислении accept key:', error);
           reject(error);
         });
       } catch (error) {
-        logger.error('[WebSocket Client] Ошибка при подключении:', error);
+        console.error('[WebSocket Client] Ошибка при подключении:', error);
         this.handleError(error);
         reject(error);
       }
@@ -470,20 +467,18 @@ class WebSocketClient {
           this.isConnected = true;
           this.buffer = Buffer.alloc(0);
           this.reconnectAttempts = 0;
+          this.lastPongTime = Date.now();
 
-          logger.log('[WebSocket Client] Handshake завершен, соединение установлено');
+          console.log('[WebSocket Client] Handshake завершен, соединение установлено');
+
+          // Запускаем heartbeat
+          this.startHeartbeat();
 
           if (this.onOpenCallback) {
-            try {
-              this.onOpenCallback();
-            } catch (error) {
-              logger.error('[WebSocket Client] Ошибка в onOpenCallback:', error);
-            }
+            this.onOpenCallback();
           }
         } else {
-          logger.error('[WebSocket Client] Неверный handshake ответ');
-          this.isConnected = false;
-          this.isHandshakeComplete = false;
+          console.error('[WebSocket Client] Неверный handshake ответ');
           this.handleError(new Error('Неверный handshake ответ'));
           this.disconnect();
         }
@@ -508,7 +503,7 @@ class WebSocketClient {
         if (frame.opcode === 0x1) {
           // Текстовое сообщение
           const message = frame.payload.toString('utf8');
-          logger.log('[WebSocket Client] Получено сообщение:', message);
+          console.log('[WebSocket Client] Получено сообщение:', message);
 
           if (this.onMessageCallback) {
             try {
@@ -520,14 +515,19 @@ class WebSocketClient {
           }
         } else if (frame.opcode === 0x8) {
           // Закрытие соединения
-          logger.log('[WebSocket Client] Сервер запросил закрытие');
+          console.log('[WebSocket Client] Сервер запросил закрытие');
           this.disconnect();
         } else if (frame.opcode === 0x9) {
           // Ping - отправляем Pong
           this.sendPong();
         } else if (frame.opcode === 0xa) {
           // Pong
-          logger.log('[WebSocket Client] Получен Pong');
+          this.lastPongTime = Date.now();
+          if (this.heartbeatTimeout) {
+            clearTimeout(this.heartbeatTimeout);
+            this.heartbeatTimeout = null;
+          }
+          console.log('[WebSocket Client] Получен Pong');
         }
       }
     }
@@ -538,34 +538,17 @@ class WebSocketClient {
    * @param {Object|string} data Данные для отправки
    */
   send(data) {
-    // Проверяем состояние соединения более тщательно
-    if (!this.socket || !this.isConnected || !this.isHandshakeComplete) {
-      logger.warn('[WebSocket Client] Попытка отправить данные без подключения');
-      // Сбрасываем состояние, если сокет не существует
-      if (!this.socket) {
-        this.isConnected = false;
-        this.isHandshakeComplete = false;
-      }
+    if (!this.isConnected || !this.isHandshakeComplete) {
+      console.warn('[WebSocket Client] Попытка отправить данные без подключения');
       return;
     }
 
     try {
-      // Дополнительная проверка состояния сокета перед отправкой
-      if (this.socket.destroyed || this.socket.readyState === 'closed') {
-        logger.warn('[WebSocket Client] Попытка отправить данные на закрытый сокет');
-        this.isConnected = false;
-        this.isHandshakeComplete = false;
-        return;
-      }
-
       const message = typeof data === 'string' ? data : JSON.stringify(data);
       const frame = createWebSocketFrame(message, 0x1);
       this.socket.write(frame);
     } catch (error) {
-      logger.error('[WebSocket Client] Ошибка при отправке данных:', error);
-      // При ошибке отправки сбрасываем состояние соединения
-      this.isConnected = false;
-      this.isHandshakeComplete = false;
+      console.error('[WebSocket Client] Ошибка при отправке данных:', error);
       this.handleError(error);
     }
   }
@@ -596,23 +579,20 @@ class WebSocketClient {
    * Обрабатывает закрытие соединения
    */
   handleClose() {
-    const wasConnected = this.isConnected;
+    this.stopHeartbeat();
     this.isConnected = false;
     this.isHandshakeComplete = false;
     this.buffer = Buffer.alloc(0);
+    this.lastPongTime = null;
 
     if (this.onCloseCallback) {
-      try {
-        this.onCloseCallback();
-      } catch (error) {
-        logger.error('[WebSocket Client] Ошибка в onCloseCallback:', error);
-      }
+      this.onCloseCallback();
     }
 
-    // Попытка переподключения только если соединение было установлено
-    if (wasConnected && this.reconnectAttempts < this.maxReconnectAttempts) {
+    // Попытка переподключения
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      logger.log(`[WebSocket Client] Попытка переподключения ${this.reconnectAttempts}/${this.maxReconnectAttempts} через ${this.reconnectDelay}ms`);
+      console.log(`[WebSocket Client] Попытка переподключения ${this.reconnectAttempts}/${this.maxReconnectAttempts} через ${this.reconnectDelay}ms`);
 
       this.reconnectTimer = setTimeout(() => {
         this.connect(
@@ -621,11 +601,68 @@ class WebSocketClient {
           this.onErrorCallback,
           this.onCloseCallback
         ).catch((error) => {
-          logger.error('[WebSocket Client] Ошибка при переподключении:', error);
+          console.error('[WebSocket Client] Ошибка при переподключении:', error);
         });
       }, this.reconnectDelay);
-    } else if (wasConnected) {
-      logger.log('[WebSocket Client] Достигнуто максимальное количество попыток переподключения');
+    } else {
+      console.log('[WebSocket Client] Достигнуто максимальное количество попыток переподключения');
+    }
+  }
+
+  /**
+   * Запускает heartbeat (keep-alive)
+   */
+  startHeartbeat() {
+    this.stopHeartbeat();
+
+    // Отправляем Ping периодически
+    this.heartbeatInterval = setInterval(() => {
+      if (this.isConnected && this.isHandshakeComplete) {
+        this.sendPing();
+      } else {
+        this.stopHeartbeat();
+      }
+    }, this.heartbeatIntervalMs);
+  }
+
+  /**
+   * Останавливает heartbeat
+   */
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout);
+      this.heartbeatTimeout = null;
+    }
+  }
+
+  /**
+   * Отправляет Ping frame
+   */
+  sendPing() {
+    if (!this.isConnected || !this.isHandshakeComplete) {
+      return;
+    }
+
+    try {
+      const frame = createWebSocketFrame('', 0x9); // Ping opcode
+      this.socket.write(frame);
+      console.log('[WebSocket Client] Отправлен Ping');
+
+      // Устанавливаем таймаут на ответ
+      this.heartbeatTimeout = setTimeout(() => {
+        const now = Date.now();
+        if (this.lastPongTime && (now - this.lastPongTime) > this.heartbeatTimeoutMs) {
+          console.warn('[WebSocket Client] Таймаут heartbeat, переподключение...');
+          this.handleError(new Error('Heartbeat timeout'));
+          this.disconnect();
+        }
+      }, this.heartbeatTimeoutMs);
+    } catch (error) {
+      console.error('[WebSocket Client] Ошибка при отправке Ping:', error);
     }
   }
 
@@ -633,6 +670,8 @@ class WebSocketClient {
    * Отключается от сервера
    */
   disconnect() {
+    this.stopHeartbeat();
+
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -647,7 +686,7 @@ class WebSocketClient {
         }
         this.socket.destroy();
       } catch (error) {
-        logger.error('[WebSocket Client] Ошибка при отключении:', error);
+        console.error('[WebSocket Client] Ошибка при отключении:', error);
       }
       this.socket = null;
     }
@@ -656,6 +695,7 @@ class WebSocketClient {
     this.isHandshakeComplete = false;
     this.buffer = Buffer.alloc(0);
     this.reconnectAttempts = 0;
+    this.lastPongTime = null;
   }
 
   /**

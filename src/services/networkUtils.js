@@ -146,5 +146,25 @@ export const subscribeToNetworkChanges = (callback) => {
  * @returns {number} Номер порта
  */
 export const getDefaultWebSocketPort = () => {
-  return 8888; // Изменен с 8080 на 8888 для избежания конфликтов
+  return 8080; // Порт для WebSocket соединений (как указано в требованиях)
+};
+
+/**
+ * Проверяет, является ли строка валидным IPv4 адресом
+ * @param {string} ip IP адрес для проверки
+ * @returns {boolean} true если это валидный IPv4 адрес
+ */
+export const isValidIPv4 = (ip) => {
+  if (!ip || typeof ip !== 'string') {
+    return false;
+  }
+  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (!ipRegex.test(ip)) {
+    return false;
+  }
+  const parts = ip.split('.');
+  return parts.every(part => {
+    const num = parseInt(part, 10);
+    return num >= 0 && num <= 255;
+  });
 };

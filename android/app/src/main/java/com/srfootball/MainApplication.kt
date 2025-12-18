@@ -34,6 +34,11 @@ class MainApplication : Application(), ReactApplication {
 
   override fun onCreate() {
     super.onCreate()
+
+    // Принудительно используем IPv4 вместо IPv6 для избежания проблем с подключением
+    // Это решает проблему ECONNREFUSED при подключении к внешним IP адресам на Android
+    System.setProperty("java.net.preferIPv4Stack", "true")
+
     SoLoader.init(this, false)
     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
       // If you opted-in for the New Architecture, we load the native entry point for this app.

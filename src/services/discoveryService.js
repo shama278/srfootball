@@ -1,191 +1,454 @@
-import TcpSocket from 'react-native-tcp-socket';
 import {getLocalIPAddress, getDefaultWebSocketPort} from './networkUtils';
-import logger from './logger';
+import {Platform} from 'react-native';
+import {Buffer} from 'buffer';
 
-// Импортируем UdpSocket с проверкой на доступность
-let UdpSocket = null;
-try {
-  const udpModule = require('@ohmi/react-native-udp');
-  // Проверяем разные варианты экспорта
-  UdpSocket = udpModule.default || udpModule.UdpSocket || udpModule;
-  // Проверяем, что это действительно объект с методом createSocket
-  if (!UdpSocket || typeof UdpSocket.createSocket !== 'function') {
-    logger.error('[Discovery] UdpSocket не содержит метод createSocket');
-    UdpSocket = null;
-  }
-} catch (error) {
-  logger.error('[Discovery] Не удалось загрузить @ohmi/react-native-udp:', error?.message || error);
-  UdpSocket = null;
-}
+// Импорт UDP модуля - используем react-native-udp (более стабильный модуль)
+import dgram from 'react-native-udp';
 
-// Полифилл для Buffer в React Native
-if (typeof Buffer === 'undefined') {
-  global.Buffer = require('buffer').Buffer;
-}
-
-const DISCOVERY_PORT = 8889; // Порт для UDP broadcast
-const DISCOVERY_INTERVAL = 2000; // Отправка каждые 2 секунды
-const DISCOVERY_MAGIC = 'SRFOOTBALL_DISPLAY'; // Магическая строка для идентификации табло
+const DISCOVERY_PORT = 41234; // Порт для UDP discovery (как указано в требованиях)
+const DISCOVERY_INTERVAL = 500; // Отправка каждые 500ms для быстрого обнаружения
+const DISCOVERY_MESSAGE = 'SRFOOTBALL_DISCOVERY'; // Сообщение от контроллера (ищет табло)
+const DISCOVERY_RESPONSE_PREFIX = 'SRFOOTBALL_HERE:'; // Префикс ответа от табло
 
 /**
- * Сервис для автоматического обнаружения контроллера через UDP broadcast
+ * Сервис для автоматического обнаружения устройств через UDP broadcast/multicast
+ * Архитектура:
+ * - CONTROLLER (контроллер) отправляет "SRFOOTBALL_DISCOVERY" в сеть и слушает ответы
+ * - DISPLAY (табло) слушает "SRFOOTBALL_DISCOVERY" и отвечает "SRFOOTBALL_HERE:<deviceName>:<tcpPort>"
  */
 class DiscoveryService {
   constructor() {
-    this.broadcastSocket = null;
-    this.listenSocket = null;
+    // Сохраняем ссылку на dgram модуль
+    if (!dgram || typeof dgram.createSocket !== 'function') {
+      console.error('[Discovery] UDP модуль не загружен. Проверьте установку react-native-udp');
+      throw new Error('UDP модуль (dgram) не инициализирован. Проверьте импорт react-native-udp и пересоберите приложение');
+    }
+    this.dgram = dgram; // Сохраняем ссылку на модуль в экземпляре класса
+    console.log('[Discovery] UDP модуль успешно инициализирован');
+
+    // Для контроллера (отправляет запросы и слушает ответы)
+    this.broadcastSocket = null; // UDP сокет для отправки discovery запросов (контроллер)
+    this.listenSocket = null; // UDP сокет для приема ответов от табло (контроллер)
     this.broadcastInterval = null;
-    this.isBroadcasting = false;
-    this.isListening = false;
-    this.onControllerFound = null;
+    this.isBroadcasting = false; // Контроллер отправляет discovery запросы
+
+    // Для табло (слушает запросы и отвечает)
+    this.responseListenSocket = null; // UDP сокет для приема discovery запросов (табло)
+    this.responseSocket = null; // UDP сокет для отправки ответов (табло)
+    this.isResponding = false; // Табло отвечает на discovery запросы
+
+    this.onDeviceFound = null; // Колбэк при обнаружении устройства (для контроллера)
+    this.foundDevices = new Map(); // Map<deviceKey, {ip, port, deviceName, lastSeen}>
+    this.deviceName = Platform.OS === 'android' ? 'Android Device' : 'iOS Device';
+    this.cleanupInterval = null;
+    this.localIP = null; // Кэшируем локальный IP для фильтрации собственных сообщений
   }
 
   /**
-   * Вычисляет broadcast адрес для заданного IP адреса
-   * @param {string} ip IP адрес
-   * @returns {string} Broadcast адрес
+   * Устанавливает имя устройства
+   * @param {string} name Имя устройства
    */
-  calculateBroadcastAddress(ip) {
-    try {
-      const parts = ip.split('.');
-      if (parts.length === 4) {
-        // Для большинства домашних сетей используем стандартные broadcast адреса
-        // В зависимости от диапазона IP
-        const firstOctet = parseInt(parts[0], 10);
-        const secondOctet = parseInt(parts[1], 10);
+  setDeviceName(name) {
+    this.deviceName = name || this.deviceName;
+  }
 
-        // Стандартные диапазоны
-        if (firstOctet === 192 && secondOctet === 168) {
-          return `${parts[0]}.${parts[1]}.${parts[2]}.255`;
-        } else if (firstOctet === 10) {
-          return '10.255.255.255';
-        } else if (firstOctet === 172 && secondOctet >= 16 && secondOctet <= 31) {
-          return `${parts[0]}.${parts[1]}.255.255`;
-        }
-      }
-    } catch (error) {
-      logger.error('[Discovery] Ошибка при вычислении broadcast адреса:', error);
+  /**
+   * Запускает broadcast для контроллера (ищет табло)
+   * Контроллер отправляет "SRFOOTBALL_DISCOVERY" и слушает ответы "SRFOOTBALL_HERE:..."
+   * @param {Function} onDeviceFound Колбэк при обнаружении табло (ip, port, deviceName)
+   * @returns {Promise<void>}
+   */
+  startBroadcast(onDeviceFound) {
+    if (this.isBroadcasting) {
+      return Promise.resolve();
     }
 
-    // По умолчанию используем глобальный broadcast
-    return '255.255.255.255';
+    return new Promise(async (resolve, reject) => {
+      try {
+        this.onDeviceFound = onDeviceFound;
+
+        // Получаем локальный IP для фильтрации собственных сообщений
+        try {
+          this.localIP = await getLocalIPAddress();
+          console.log(`[Discovery] Контроллер: локальный IP для фильтрации: ${this.localIP || 'не определен'}`);
+        } catch (error) {
+          console.warn('[Discovery] Контроллер: не удалось получить локальный IP для фильтрации:', error);
+          this.localIP = null;
+        }
+
+        // Создаем UDP сокет для отправки discovery запросов
+        if (!this.dgram || typeof this.dgram.createSocket !== 'function') {
+          throw new Error('UDP модуль недоступен в методе startBroadcast');
+        }
+        this.broadcastSocket = this.dgram.createSocket('udp4');
+
+        this.broadcastSocket.bind(0, '0.0.0.0', () => {
+          // Включаем broadcast
+          if (this.broadcastSocket && typeof this.broadcastSocket.setBroadcast === 'function') {
+            this.broadcastSocket.setBroadcast(true);
+          }
+          this.isBroadcasting = true;
+
+          console.log(`[Discovery] Контроллер: запущен broadcast для поиска табло`);
+
+          // Отправляем discovery запросы периодически
+          let requestCount = 0;
+          this.broadcastInterval = setInterval(() => {
+            if (!this.broadcastSocket || !this.isBroadcasting) {
+              return; // Сокет закрыт или broadcast остановлен
+            }
+            const message = DISCOVERY_MESSAGE;
+            requestCount++;
+            // Логируем только каждое 10-е сообщение, чтобы не засорять логи
+            if (requestCount % 10 === 0) {
+              console.log(`[Discovery] Контроллер: отправлено ${requestCount} discovery запросов, ответов пока нет`);
+            }
+            const buffer = Buffer.from(message, 'utf8');
+
+            // Отправляем на broadcast адрес
+            try {
+              this.broadcastSocket.send(
+                buffer,
+                0,
+                buffer.length,
+                DISCOVERY_PORT,
+                '255.255.255.255',
+                (err) => {
+                  if (err) {
+                    console.error('[Discovery] Контроллер: ошибка при отправке discovery запроса:', err);
+                  }
+                  // Убираем успешное логирование, чтобы не засорять логи
+                }
+              );
+            } catch (error) {
+              console.error('[Discovery] Контроллер: ошибка при отправке:', error);
+            }
+          }, DISCOVERY_INTERVAL);
+
+          // Отправляем сразу при запуске
+          console.log(`[Discovery] Контроллер: отправка первого discovery запроса...`);
+          if (this.broadcastSocket) {
+            try {
+              const initialBuffer = Buffer.from(DISCOVERY_MESSAGE, 'utf8');
+              this.broadcastSocket.send(
+                initialBuffer,
+                0,
+                initialBuffer.length,
+                DISCOVERY_PORT,
+                '255.255.255.255',
+                (err) => {
+                  if (err) {
+                    console.error('[Discovery] Контроллер: ошибка при отправке начального discovery запроса:', err);
+                  } else {
+                    console.log('[Discovery] Контроллер: отправлен начальный discovery запрос');
+                  }
+                }
+              );
+            } catch (error) {
+              console.error('[Discovery] Контроллер: ошибка при отправке начального запроса:', error);
+            }
+          }
+
+          resolve();
+        });
+
+        if (this.broadcastSocket && typeof this.broadcastSocket.on === 'function') {
+          this.broadcastSocket.on('error', (error) => {
+            console.error('[Discovery] Контроллер: ошибка broadcast сокета:', error);
+            reject(error);
+          });
+        }
+
+        // Запускаем прослушивание ответов от табло
+        this.startListeningForResponses();
+      } catch (error) {
+        console.error('[Discovery] Контроллер: ошибка при запуске broadcast:', error);
+        reject(error);
+      }
+    });
   }
 
   /**
-   * Запускает broadcast для табло
-   * @param {string} displayIP IP адрес табло
-   * @param {number} displayPort Порт WebSocket сервера
+   * Контроллер слушает ответы от табло
    */
-  startBroadcast(displayIP, displayPort) {
-    if (this.isBroadcasting) {
+  startListeningForResponses() {
+    if (this.listenSocket) {
       return;
     }
 
     try {
-      if (!UdpSocket) {
-        logger.error('[Discovery] UdpSocket не доступен (модуль не загружен), broadcast не может быть запущен');
-        return;
+      // Создаем UDP сокет для приема ответов от табло
+      if (!this.dgram || typeof this.dgram.createSocket !== 'function') {
+        throw new Error('UDP модуль недоступен в методе startListeningForResponses');
       }
+      this.listenSocket = this.dgram.createSocket('udp4');
 
-      if (typeof UdpSocket.createSocket !== 'function') {
-        logger.error('[Discovery] UdpSocket не содержит метод createSocket для broadcast. Тип:', typeof UdpSocket);
-        return;
-      }
-
-      // Создаем UDP сокет для отправки broadcast
-      try {
-        this.broadcastSocket = UdpSocket.createSocket('udp4');
-        if (!this.broadcastSocket) {
-          logger.error('[Discovery] createSocket для broadcast вернул null или undefined');
-          return;
+      this.listenSocket.bind(DISCOVERY_PORT, '0.0.0.0', () => {
+        // Включаем broadcast для приема
+        if (this.listenSocket && typeof this.listenSocket.setBroadcast === 'function') {
+          this.listenSocket.setBroadcast(true);
         }
-      } catch (createError) {
-        const errorMsg = createError?.message || createError?.toString() || String(createError) || 'Неизвестная ошибка';
-        logger.error('[Discovery] Ошибка при создании UDP сокета для broadcast:', errorMsg);
-        logger.error('[Discovery] Стек ошибки:', createError?.stack);
-        return;
-      }
 
-      if (!this.broadcastSocket) {
-        logger.error('[Discovery] Не удалось создать UDP сокет для broadcast');
-        return;
-      }
+        console.log('[Discovery] Контроллер: начато прослушивание ответов от табло');
 
-      this.broadcastSocket.bind(0, () => {
-        // Включаем broadcast
-        this.broadcastSocket.setBroadcast(true);
-        this.isBroadcasting = true;
+        if (this.listenSocket && typeof this.listenSocket.on === 'function') {
+          this.listenSocket.on('message', (msg, rinfo) => {
+          const buffer = Buffer.from(msg);
+          try {
+            const messageStr = buffer.toString('utf8').trim();
 
-        // Вычисляем broadcast адрес для сети
-        const broadcastAddr = this.calculateBroadcastAddress(displayIP);
-        logger.log(`[Discovery] Используется broadcast адрес: ${broadcastAddr} для IP ${displayIP}`);
+            // Игнорируем собственные broadcast сообщения (без логирования, чтобы не засорять логи)
+            if (this.localIP && rinfo.address === this.localIP) {
+              return; // Игнорируем без логирования
+            }
 
-        // Функция для отправки broadcast сообщения
-        const sendBroadcast = (targetAddress) => {
-          const message = JSON.stringify({
-            magic: DISCOVERY_MAGIC,
-            type: 'display',
-            ip: displayIP,
-            port: displayPort,
-            timestamp: Date.now(),
-          });
+            // Также игнорируем discovery запросы (не ответы)
+            if (messageStr === DISCOVERY_MESSAGE) {
+              return; // Игнорируем без логирования
+            }
 
-          const buffer = Buffer.from(message, 'utf8');
+            // Логируем только реальные сообщения от других устройств
+            console.log(`[Discovery] Контроллер: получено сообщение от ${rinfo.address}:${rinfo.port}: "${messageStr}"`);
 
-          // Отправляем на вычисленный broadcast адрес
-          this.broadcastSocket.send(
-            buffer,
-            0,
-            buffer.length,
-            DISCOVERY_PORT,
-            targetAddress,
-            (err, bytes) => {
-              if (err) {
-                // Не логируем каждую ошибку, чтобы не засорять консоль
-                // Только периодически
-                if (Math.random() < 0.1) { // Логируем только 10% ошибок
-                  logger.error('[Discovery] Ошибка при отправке broadcast:', err.message || err);
+            // Проверяем формат ответа: "SRFOOTBALL_HERE:<deviceName>:<tcpPort>"
+            if (messageStr.startsWith(DISCOVERY_RESPONSE_PREFIX)) {
+              const responseData = messageStr.substring(DISCOVERY_RESPONSE_PREFIX.length);
+              const parts = responseData.split(':');
+
+              if (parts.length >= 2) {
+                const deviceName = parts[0];
+                const tcpPort = parseInt(parts[1], 10);
+                const serverIP = rinfo.address;
+
+                if (!isNaN(tcpPort) && tcpPort > 0 && tcpPort < 65536) {
+                  const deviceKey = `${serverIP}:${tcpPort}`;
+
+                  // Проверяем, не нашли ли мы уже это устройство
+                  const alreadyFound = this.foundDevices.has(deviceKey);
+
+                  // Обновляем информацию об устройстве
+                  this.foundDevices.set(deviceKey, {
+                    ip: serverIP,
+                    port: tcpPort,
+                    deviceName: deviceName || 'Unknown Device',
+                    lastSeen: Date.now(),
+                  });
+
+                  if (!alreadyFound) {
+                    // Это новое устройство - логируем и вызываем колбэк
+                    console.log(`[Discovery] ========================================`);
+                    console.log(`[Discovery] КОНТРОЛЛЕР: НАЙДЕНО ТАБЛО!`);
+                    console.log(`[Discovery] Имя устройства: ${deviceName || 'Unknown Device'}`);
+                    console.log(`[Discovery] IP адрес: ${serverIP}`);
+                    console.log(`[Discovery] Порт WebSocket: ${tcpPort}`);
+                    console.log(`[Discovery] Полный адрес: ${serverIP}:${tcpPort}`);
+                    console.log(`[Discovery] ========================================`);
+
+                    // Вызываем колбэк
+                    if (this.onDeviceFound) {
+                      console.log(`[Discovery] Контроллер: вызов колбэка onDeviceFound с адресом ${serverIP}:${tcpPort}`);
+                      this.onDeviceFound(serverIP, tcpPort, deviceName);
+                    } else {
+                      console.warn(`[Discovery] Контроллер: колбэк onDeviceFound не установлен!`);
+                    }
+                  } else {
+                    // Устройство уже было найдено ранее - просто обновляем время
+                    console.log(`[Discovery] Контроллер: обновлена информация о табло ${serverIP}:${tcpPort} (уже было найдено ранее)`);
+                  }
+                } else {
+                  console.warn(`[Discovery] Контроллер: некорректный порт в ответе от ${serverIP}: ${parts[1]}`);
                 }
               } else {
-                // Логируем только периодически, чтобы не засорять консоль
-                if (Math.random() < 0.1) { // Логируем только 10% успешных отправок
-                  logger.log(`[Discovery] Broadcast отправлен на ${targetAddress}: ${displayIP}:${displayPort}`);
-                }
+                console.warn(`[Discovery] Контроллер: некорректный формат ответа от ${rinfo.address}`);
               }
             }
-          );
-        };
-
-        // Отправляем broadcast сообщения периодически
-        this.broadcastInterval = setInterval(() => {
-          // Пробуем отправить на несколько адресов для надежности
-          sendBroadcast(broadcastAddr);
-          // Также пробуем глобальный broadcast на случай если сетевой не работает
-          if (broadcastAddr !== '255.255.255.255') {
-            sendBroadcast('255.255.255.255');
+            // Игнорируем другие сообщения
+          } catch (error) {
+            console.log('[Discovery] Контроллер: ошибка при обработке ответа:', error.message);
           }
-        }, DISCOVERY_INTERVAL);
+          });
 
-        // Отправляем сразу при запуске
-        sendBroadcast(broadcastAddr);
-        if (broadcastAddr !== '255.255.255.255') {
-          sendBroadcast('255.255.255.255');
+          this.listenSocket.on('error', (error) => {
+            console.error('[Discovery] Контроллер: ошибка listen сокета:', error);
+          });
         }
       });
 
-      this.broadcastSocket.on('error', (error) => {
-        // Не критичная ошибка, просто логируем
-        logger.error('[Discovery] Ошибка broadcast сокета:', error.message || error);
-        // Не останавливаем broadcast при ошибках, так как это может быть временная проблема
-      });
+      if (this.listenSocket && typeof this.listenSocket.on === 'function') {
+        this.listenSocket.on('error', (error) => {
+          console.error('[Discovery] Контроллер: ошибка при привязке listen сокета:', error);
+        });
+      }
+
+      // Запускаем очистку устаревших устройств
+      this.startCleanup();
     } catch (error) {
-      logger.error('[Discovery] Ошибка при запуске broadcast:', error.message || error);
-      // Не выбрасываем ошибку, чтобы не блокировать работу приложения
+      console.error('[Discovery] Контроллер: ошибка при запуске прослушивания:', error);
     }
   }
 
   /**
-   * Останавливает broadcast
+   * Табло начинает слушать discovery запросы от контроллера и отвечать на них
+   * @param {string} serverIP IP адрес табло
+   * @param {number} serverPort Порт WebSocket сервера табло
+   */
+  startResponding(serverIP, serverPort) {
+    if (this.isResponding) {
+      return;
+    }
+
+    try {
+      // Создаем UDP сокет для приема discovery запросов
+      if (!this.dgram || typeof this.dgram.createSocket !== 'function') {
+        throw new Error('UDP модуль недоступен в методе startResponding');
+      }
+      this.responseListenSocket = this.dgram.createSocket('udp4');
+
+      // Устанавливаем обработчики событий ДО привязки, чтобы не пропустить события
+      if (this.responseListenSocket && typeof this.responseListenSocket.on === 'function') {
+        this.responseListenSocket.on('message', (msg, rinfo) => {
+          try {
+            const buffer = Buffer.from(msg);
+            const messageStr = buffer.toString('utf8').trim();
+
+            console.log(`[Discovery] Табло: получено сообщение от ${rinfo.address}:${rinfo.port}: "${messageStr}"`);
+
+            // Проверяем discovery запрос
+            if (messageStr === DISCOVERY_MESSAGE) {
+              console.log(`[Discovery] Табло: получен discovery запрос от ${rinfo.address}:${rinfo.port}`);
+
+              // Отвечаем на запрос
+              this.sendResponse(rinfo.address, rinfo.port, serverIP, serverPort);
+            } else {
+              console.log(`[Discovery] Табло: неизвестное сообщение: "${messageStr}"`);
+            }
+          } catch (error) {
+            console.error('[Discovery] Табло: ошибка при обработке запроса:', error);
+          }
+        });
+
+        this.responseListenSocket.on('error', (error) => {
+          console.error('[Discovery] Табло: ошибка listen сокета:', error);
+        });
+
+        this.responseListenSocket.on('close', () => {
+          console.log('[Discovery] Табло: listen сокет закрыт');
+        });
+      }
+
+      this.responseListenSocket.bind(DISCOVERY_PORT, '0.0.0.0', () => {
+        // Включаем broadcast для приема
+        if (this.responseListenSocket && typeof this.responseListenSocket.setBroadcast === 'function') {
+          this.responseListenSocket.setBroadcast(true);
+          console.log('[Discovery] Табло: broadcast включен для listen сокета');
+        }
+        this.isResponding = true;
+
+        console.log(`[Discovery] Табло: начато прослушивание discovery запросов на порту ${DISCOVERY_PORT}`);
+        console.log(`[Discovery] Табло: будет отвечать с IP ${serverIP} и портом ${serverPort}`);
+      });
+
+      // Обработчики уже установлены выше, перед bind
+    } catch (error) {
+      console.error('[Discovery] Табло: ошибка при запуске прослушивания:', error);
+    }
+  }
+
+  /**
+   * Табло отправляет ответ на discovery запрос
+   * @param {string} clientIP IP адрес контроллера
+   * @param {number} clientPort Порт контроллера
+   * @param {string} serverIP IP адрес табло
+   * @param {number} serverPort Порт WebSocket сервера табло
+   */
+  sendResponse(clientIP, clientPort, serverIP, serverPort) {
+    try {
+      // Создаем временный сокет для отправки ответа
+      if (!this.responseSocket) {
+        if (!this.dgram || typeof this.dgram.createSocket !== 'function') {
+          throw new Error('UDP модуль недоступен в методе sendResponse');
+        }
+        this.responseSocket = this.dgram.createSocket('udp4');
+
+        this.responseSocket.bind(0, '0.0.0.0', () => {
+          if (this.responseSocket && typeof this.responseSocket.setBroadcast === 'function') {
+            this.responseSocket.setBroadcast(true);
+          }
+        });
+
+        if (this.responseSocket && typeof this.responseSocket.on === 'function') {
+          this.responseSocket.on('error', (error) => {
+            console.error('[Discovery] Табло: ошибка response сокета:', error);
+          });
+        }
+      }
+
+      if (!this.responseSocket) {
+        console.error('[Discovery] Табло: responseSocket не создан');
+        return;
+      }
+
+      const responseMessage = `${DISCOVERY_RESPONSE_PREFIX}${this.deviceName}:${serverPort}`;
+      console.log(`[Discovery] Табло: отправка ответа "${responseMessage}" на ${clientIP}:${clientPort}`);
+      const buffer = Buffer.from(responseMessage, 'utf8');
+
+      // Отвечаем на DISCOVERY_PORT, иначе при broadcast с эфемерного порта
+      // ответы улетают туда, где контроллер не слушает, и discovery не срабатывает.
+      try {
+        this.responseSocket.send(
+          buffer,
+          0,
+          buffer.length,
+          DISCOVERY_PORT,
+          clientIP,
+          (err) => {
+            if (err) {
+              console.error('[Discovery] Табло: ошибка при отправке ответа:', err);
+            } else {
+              console.log(`[Discovery] Табло: отправлен ответ на ${clientIP}:${clientPort} (${serverIP}:${serverPort})`);
+            }
+          }
+        );
+      } catch (error) {
+        console.error('[Discovery] Табло: ошибка при отправке ответа:', error);
+      }
+    } catch (error) {
+      console.error('[Discovery] Табло: ошибка при отправке ответа:', error);
+    }
+  }
+
+  /**
+   * Запускает периодическую очистку устаревших устройств
+   */
+  startCleanup() {
+    if (this.cleanupInterval) {
+      return;
+    }
+
+    // Очищаем устройства, которые не отвечали более 10 секунд
+    this.cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      const timeout = 10000; // 10 секунд
+
+      this.foundDevices.forEach((device, key) => {
+        if (now - device.lastSeen > timeout) {
+          console.log(`[Discovery] Устройство ${key} удалено (таймаут)`);
+          this.foundDevices.delete(key);
+        }
+      });
+    }, 5000); // Проверяем каждые 5 секунд
+  }
+
+  /**
+   * Получает список найденных устройств
+   * @returns {Array<{ip: string, port: number, deviceName: string, lastSeen: number}>}
+   */
+  getFoundDevices() {
+    return Array.from(this.foundDevices.values());
+  }
+
+  /**
+   * Останавливает broadcast (контроллер)
    */
   stopBroadcast() {
     if (this.broadcastInterval) {
@@ -197,144 +460,56 @@ class DiscoveryService {
       try {
         this.broadcastSocket.close();
       } catch (error) {
-        logger.error('[Discovery] Ошибка при закрытии broadcast сокета:', error);
+        console.error('[Discovery] Ошибка при закрытии broadcast сокета:', error);
       }
       this.broadcastSocket = null;
+    }
+
+    if (this.listenSocket) {
+      try {
+        this.listenSocket.close();
+      } catch (error) {
+        console.error('[Discovery] Ошибка при закрытии listen сокета:', error);
+      }
+      this.listenSocket = null;
     }
 
     this.isBroadcasting = false;
   }
 
   /**
-   * Начинает слушать broadcast сообщения от табло
-   * @param {Function} onDisplayFound Колбэк при обнаружении табло (ip, port)
-   * @returns {Promise<void>}
+   * Останавливает прослушивание и ответы (табло)
    */
-  startListening(onDisplayFound) {
-    if (this.isListening) {
-      return Promise.resolve();
+  stopResponding() {
+    if (this.responseListenSocket) {
+      try {
+        this.responseListenSocket.close();
+      } catch (error) {
+        console.error('[Discovery] Ошибка при закрытии response listen сокета:', error);
+      }
+      this.responseListenSocket = null;
     }
 
-    return new Promise((resolve, reject) => {
+    if (this.responseSocket) {
       try {
-        if (!UdpSocket) {
-          const errorMsg = 'UdpSocket не доступен (модуль не загружен), прослушивание не может быть запущено';
-          logger.error('[Discovery] ' + errorMsg);
-          this.isListening = false;
-          resolve(); // Разрешаем промис, чтобы не блокировать UI
-          return;
-        }
-
-        if (typeof UdpSocket.createSocket !== 'function') {
-          logger.error('[Discovery] UdpSocket не содержит метод createSocket. Тип:', typeof UdpSocket, 'Ключи:', Object.keys(UdpSocket || {}));
-          this.isListening = false;
-          resolve(); // Разрешаем промис, чтобы не блокировать UI
-          return;
-        }
-
-        this.onControllerFound = onDisplayFound;
-
-        // Создаем UDP сокет для приема broadcast
-        try {
-          this.listenSocket = UdpSocket.createSocket('udp4');
-          if (!this.listenSocket) {
-            logger.error('[Discovery] createSocket вернул null или undefined');
-            this.isListening = false;
-            resolve(); // Разрешаем промис, чтобы не блокировать UI
-            return;
-          }
-        } catch (createError) {
-          const errorMsg = createError?.message || createError?.toString() || String(createError) || 'Неизвестная ошибка';
-          logger.error('[Discovery] Ошибка при создании UDP сокета:', errorMsg);
-          logger.error('[Discovery] Стек ошибки:', createError?.stack);
-          this.isListening = false;
-          resolve(); // Разрешаем промис, чтобы не блокировать UI
-          return;
-        }
-
-        if (!this.listenSocket) {
-          const errorMsg = 'Не удалось создать UDP сокет для прослушивания';
-          logger.error('[Discovery] ' + errorMsg);
-          this.isListening = false;
-          resolve(); // Разрешаем промис, чтобы не блокировать UI
-          return;
-        }
-
-        this.listenSocket.bind(DISCOVERY_PORT, () => {
-          // Включаем broadcast для приема
-          this.listenSocket.setBroadcast(true);
-          this.isListening = true;
-
-          logger.log('[Discovery] Начато прослушивание broadcast сообщений на порту', DISCOVERY_PORT);
-
-          this.listenSocket.on('message', (buffer, rinfo) => {
-            try {
-              const messageStr = buffer.toString('utf8');
-              const message = JSON.parse(messageStr);
-
-              // Проверяем магическую строку
-              if (message.magic === DISCOVERY_MAGIC && message.type === 'display') {
-                logger.log(
-                  `[Discovery] Найдено табло: ${message.ip}:${message.port} от ${rinfo.address}`
-                );
-
-                if (this.onControllerFound) {
-                  this.onControllerFound(message.ip, message.port);
-                }
-              }
-            } catch (error) {
-              // Игнорируем некорректные сообщения
-              const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-              logger.log('[Discovery] Получено некорректное сообщение:', errorMsg);
-            }
-          });
-
-          this.listenSocket.on('error', (error) => {
-            // Не отклоняем промис при ошибках после успешного запуска
-            // Это может быть нормально при проблемах с сетью
-            const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-            logger.error('[Discovery] Ошибка listen сокета:', errorMsg);
-            // Не вызываем reject, так как это может быть временная проблема
-          });
-
-          // Разрешаем промис успешно, даже если могут быть ошибки
-          resolve();
-        });
-
-        this.listenSocket.on('error', (error) => {
-          // Ошибка при привязке - это критично
-          const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-          logger.error('[Discovery] Ошибка при привязке listen сокета:', errorMsg);
-          // Не отклоняем промис, чтобы не блокировать работу при раздаче Wi-Fi
-          // Вместо этого просто логируем ошибку
-          this.isListening = false;
-          resolve(); // Разрешаем промис, чтобы не блокировать UI
-        });
+        this.responseSocket.close();
       } catch (error) {
-        const errorMsg = error?.message || error?.toString() || String(error) || 'Неизвестная ошибка';
-        logger.error('[Discovery] Ошибка при запуске прослушивания:', errorMsg);
-        // Не отклоняем промис, чтобы не блокировать работу
-        this.isListening = false;
-        resolve(); // Разрешаем промис, чтобы не блокировать UI
+        console.error('[Discovery] Ошибка при закрытии response сокета:', error);
       }
-    });
+      this.responseSocket = null;
+    }
+
+    this.isResponding = false;
   }
 
   /**
-   * Останавливает прослушивание
+   * Останавливает очистку
    */
-  stopListening() {
-    if (this.listenSocket) {
-      try {
-        this.listenSocket.close();
-      } catch (error) {
-        logger.error('[Discovery] Ошибка при закрытии listen сокета:', error);
-      }
-      this.listenSocket = null;
+  stopCleanup() {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
-
-    this.isListening = false;
-    this.onControllerFound = null;
   }
 
   /**
@@ -342,7 +517,9 @@ class DiscoveryService {
    */
   stop() {
     this.stopBroadcast();
-    this.stopListening();
+    this.stopResponding();
+    this.stopCleanup();
+    this.foundDevices.clear();
   }
 }
 

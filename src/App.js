@@ -10,8 +10,6 @@ import WebSocketClient from './services/websocketClient';
 import DiscoveryService from './services/discoveryService';
 import {getLocalIPAddress, getDefaultWebSocketPort} from './services/networkUtils';
 import {APP_MODES} from './utils/deviceDetection';
-import LogViewer from './components/LogViewer';
-import logger from './services/logger';
 
 const App = () => {
   const [mode, setMode] = useState(null);
@@ -19,111 +17,159 @@ const App = () => {
   const [websocketClient, setWebsocketClient] = useState(null);
   const [showConnectionSetup, setShowConnectionSetup] = useState(false);
   const [error, setError] = useState(null);
-  const [showLogs, setShowLogs] = useState(false);
-  const [discoveryService] = useState(() => {
-    const service = new DiscoveryService();
-    logger.log('[App] Приложение запущено');
-    logger.log('[App] DiscoveryService инициализирован');
-    return service;
-  });
+  const [discoveryService] = useState(() => new DiscoveryService());
 
   useEffect(() => {
     // Очистка при размонтировании
     return () => {
-      try {
-        if (websocketServer) {
-          websocketServer.stop();
-        }
-        if (websocketClient) {
+      // Вызываем async функции без await, так как cleanup не может быть async
+      if (websocketServer) {
+        websocketServer.stop().catch((error) => {
+          console.error('[App] Ошибка при остановке сервера при размонтировании:', error);
+        });
+      }
+      if (websocketClient) {
+        try {
           websocketClient.disconnect();
+        } catch (error) {
+          console.error('[App] Ошибка при отключении клиента при размонтировании:', error);
         }
+      }
+      try {
         discoveryService.stop();
       } catch (error) {
-        logger.error('[App] Ошибка при очистке ресурсов:', error);
+        console.error('[App] Ошибка при остановке discovery сервиса:', error);
       }
     };
   }, [websocketServer, websocketClient, discoveryService]);
+
+  const startDisplayServer = async () => {
+    try {
+      // Сначала останавливаем старый сервер, если он есть
+      if (websocketServer) {
+        console.log('[App] Останавливаем старый WebSocket сервер перед запуском нового');
+        try {
+          await websocketServer.stop();
+          // Даем время на полную остановку
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (stopError) {
+          console.error('[App] Ошибка при остановке старого сервера:', stopError);
+        }
+        setWebsocketServer(null);
+      }
+
+      const server = new WebSocketServer();
+      const ipAddress = await server.start(
+        (socketId) => {
+          console.log(`[App] Контроллер подключен к табло: ${socketId}`);
+          console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+        },
+        (socketId, message) => {
+          console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
+          // Сообщения обрабатываются в ScoreboardContext
+        },
+        (socketId) => {
+          console.log(`[App] Контроллер отключен от табло: ${socketId}`);
+          console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+        }
+      );
+      console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
+      setWebsocketServer(server);
+
+      // Запускаем ответы на discovery запросы от контроллеров
+      if (ipAddress) {
+        discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
+        console.log(`[App] Discovery ответы запущены для табло`);
+      }
+
+      // Дополнительная задержка, чтобы сервер точно был готов принимать подключения
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      return true;
+    } catch (error) {
+      console.error('[App] Ошибка при запуске WebSocket сервера:', error);
+      const errorMessage = error.message || error.toString();
+
+      // Если порт занят, пытаемся остановить старый сервер и повторить попытку
+      if (errorMessage.includes('EADDRINUSE') || errorMessage.includes('address already in use') || errorMessage.includes('port') && errorMessage.includes('already')) {
+        console.log('[App] Порт занят, пытаемся освободить его и повторить запуск');
+        try {
+          // Ждем немного и пытаемся снова
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          const server = new WebSocketServer();
+          const ipAddress = await server.start(
+            (socketId) => {
+              console.log(`[App] Контроллер подключен к табло: ${socketId}`);
+              console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+            },
+            (socketId, message) => {
+              console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
+            },
+            (socketId) => {
+              console.log(`[App] Контроллер отключен от табло: ${socketId}`);
+              console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+            }
+          );
+          console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
+          setWebsocketServer(server);
+          if (ipAddress) {
+            discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
+          }
+          return true;
+        } catch (retryError) {
+          console.error('[App] Ошибка при повторной попытке запуска сервера:', retryError);
+        }
+      }
+
+      // Не показываем ошибку, просто логируем - приложение должно работать
+      return false;
+    }
+  };
 
   const handleModeSelected = async (selectedMode) => {
     try {
       setError(null);
       setMode(selectedMode);
-      logger.log(`[App] Выбран режим: ${selectedMode === APP_MODES.CONTROLLER ? 'Контроллер' : 'Табло'}`);
 
       if (selectedMode === APP_MODES.CONTROLLER) {
         // Контроллер ищет табло и подключается к нему
         // Показываем экран поиска табло
         setShowConnectionSetup(true);
       } else if (selectedMode === APP_MODES.DISPLAY) {
-        // Табло запускает WebSocket сервер и отправляет broadcast
-        logger.log('[App] Запуск режима табло...');
-        try {
-          const server = new WebSocketServer();
-          logger.log('[App] WebSocket сервер создан, запуск...');
-          const ipAddress = await server.start(
-            (socketId) => {
-              try {
-                logger.log(`[App] Контроллер подключен к табло: ${socketId}`);
-                logger.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
-              } catch (error) {
-                logger.error('[App] Ошибка в onConnectionCallback:', error);
-              }
-            },
-            (socketId, message) => {
-              try {
-                logger.log(`[App] Сообщение от контроллера ${socketId}:`, message);
-                // Сообщения обрабатываются в ScoreboardContext
-              } catch (error) {
-                logger.error('[App] Ошибка в onMessageCallback:', error);
-              }
-            },
-            (socketId) => {
-              try {
-                logger.log(`[App] Контроллер отключен от табло: ${socketId}`);
-                logger.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
-              } catch (error) {
-                logger.error('[App] Ошибка в onDisconnectCallback:', error);
-              }
-            }
-          );
-          logger.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
-          setWebsocketServer(server);
-
-          // Запускаем broadcast для автоматического обнаружения табло
-          if (ipAddress) {
-            try {
-              discoveryService.startBroadcast(ipAddress, getDefaultWebSocketPort());
-              logger.log(`[App] Discovery broadcast запущен для табло`);
-            } catch (error) {
-              logger.error('[App] Ошибка при запуске Discovery broadcast:', error);
-              // Не блокируем работу приложения, если broadcast не запустился
-            }
-          }
-        } catch (error) {
-          const errorMsg = error?.message || error?.toString() || 'Неизвестная ошибка';
-          logger.error('[App] Ошибка при запуске WebSocket сервера:', errorMsg);
-          setError(`Ошибка при запуске сервера: ${errorMsg}`);
-          // Показываем табло даже если сервер не запустился
-        }
+        // Табло запускает WebSocket сервер
+        await startDisplayServer();
       }
     } catch (error) {
-      const errorMsg = error?.message || error?.toString() || 'Неизвестная ошибка';
-      logger.error('[App] Ошибка при выборе режима:', errorMsg);
-      setError(`Ошибка: ${errorMsg}`);
+      console.error('[App] Ошибка при выборе режима:', error);
+      // Не устанавливаем ошибку, чтобы приложение не закрывалось
+      console.error('[App] Продолжаем работу несмотря на ошибку');
     }
   };
 
-  const handleConnectToDisplay = (displayIP) => {
+  const handleConnectToDisplay = async (displayIP) => {
     try {
       const port = getDefaultWebSocketPort();
-      const client = new WebSocketClient(displayIP, port);
+      // Получаем локальный IP адрес для принудительного использования IPv4
+      const localIP = await getLocalIPAddress();
+      console.log(`[App] Получен локальный IP адрес: ${localIP || 'null'}`);
+
+      if (!localIP) {
+        console.warn(`[App] ВНИМАНИЕ: Не удалось получить локальный IP адрес! Подключение может использовать IPv6`);
+      }
+
+      const client = new WebSocketClient(displayIP, port, localIP || null);
       setWebsocketClient(client);
       setShowConnectionSetup(false);
 
-      logger.log(`[App] WebSocket клиент создан для подключения к табло ${displayIP}:${port}`);
-      logger.log(`[App] Подключение будет выполнено в ScoreboardContext`);
+      console.log(`[App] WebSocket клиент создан для подключения к табло ${displayIP}:${port}`);
+      if (localIP) {
+        console.log(`[App] Используется localAddress ${localIP} для принудительного IPv4`);
+      } else {
+        console.warn(`[App] localAddress не установлен - возможно использование IPv6!`);
+      }
+      console.log(`[App] Подключение будет выполнено в ScoreboardContext`);
     } catch (error) {
-      logger.error('[App] Ошибка при создании WebSocket клиента:', error);
+      console.error('[App] Ошибка при создании WebSocket клиента:', error);
     }
   };
 
@@ -138,16 +184,12 @@ const App = () => {
 
   if (showConnectionSetup && mode === APP_MODES.CONTROLLER) {
     return (
-      <>
-        <ConnectionSetupScreen
-          onConnect={handleConnectToDisplay}
-          onCancel={handleCancelConnection}
-          discoveryService={discoveryService}
-          isController={true}
-          onShowLogs={() => setShowLogs(true)}
-        />
-        <LogViewer visible={showLogs} onClose={() => setShowLogs(false)} />
-      </>
+      <ConnectionSetupScreen
+        onConnect={handleConnectToDisplay}
+        onCancel={handleCancelConnection}
+        discoveryService={discoveryService}
+        isController={true}
+      />
     );
   }
 
@@ -179,9 +221,12 @@ const App = () => {
       isController={isController}>
       <SafeAreaView style={styles.container}>
         <StatusBar barStyle={isController ? 'dark-content' : 'light-content'} />
-        {isController ? <ControllerScreen onShowLogs={() => setShowLogs(true)} /> : <DisplayScreen onShowLogs={() => setShowLogs(true)} />}
+        {isController ? (
+          <ControllerScreen onModeChange={() => setMode(null)} />
+        ) : (
+          <DisplayScreen onModeChange={() => setMode(null)} />
+        )}
       </SafeAreaView>
-      <LogViewer visible={showLogs} onClose={() => setShowLogs(false)} />
     </ScoreboardProvider>
   );
 };

@@ -22,7 +22,7 @@ import logger from '../services/logger';
 /**
  * Экран контроллера для планшета
  */
-const ControllerScreen = ({onShowLogs}) => {
+const ControllerScreen = ({onShowLogs, onModeChange}) => {
   const {
     state,
     updateTeam1Score,
@@ -73,6 +73,14 @@ const ControllerScreen = ({onShowLogs}) => {
               onPress={() => setShowIpInfo(!showIpInfo)}
               activeOpacity={0.7}>
               <Text style={styles.ipButtonText}>IP</Text>
+            </TouchableOpacity>
+          )}
+          {onModeChange && (
+            <TouchableOpacity
+              style={styles.modeButton}
+              onPress={onModeChange}
+              activeOpacity={0.7}>
+              <Text style={styles.modeButtonText}>⚙️</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -187,6 +195,16 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 12,
     fontWeight: '600',
+  },
+  modeButton: {
+    backgroundColor: '#9e9e9e',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  modeButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
   },
   ipInfoContainer: {
     backgroundColor: '#e3f2fd',
