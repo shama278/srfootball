@@ -168,3 +168,38 @@ export const isValidIPv4 = (ip) => {
     return num >= 0 && num <= 255;
   });
 };
+
+/**
+ * Вычисляет broadcast адрес для заданного IP адреса
+ * Использует стандартные маски подсети для популярных диапазонов
+ * @param {string} ip IP адрес
+ * @returns {string|null} Broadcast адрес или null если не удалось вычислить
+ */
+export const getBroadcastAddress = (ip) => {
+  if (!ip || !isValidIPv4(ip)) {
+    return null;
+  }
+
+  const parts = ip.split('.').map(part => parseInt(part, 10));
+  const firstOctet = parts[0];
+
+  // Определяем маску подсети на основе первого октета
+  // 192.168.x.x -> 255.255.255.0 (класс C)
+  // 10.x.x.x -> 255.0.0.0 (класс A) или 255.255.255.0 (обычно)
+  // 172.16-31.x.x -> 255.255.0.0 (класс B) или 255.255.255.0
+  // Для большинства домашних сетей используется /24 (255.255.255.0)
+
+  if (firstOctet === 192 && parts[1] === 168) {
+    // 192.168.x.x - обычно /24
+    return `${parts[0]}.${parts[1]}.${parts[2]}.255`;
+  } else if (firstOctet === 10) {
+    // 10.x.x.x - обычно /24 для домашних сетей
+    return `${parts[0]}.${parts[1]}.${parts[2]}.255`;
+  } else if (firstOctet === 172 && parts[1] >= 16 && parts[1] <= 31) {
+    // 172.16-31.x.x - обычно /24
+    return `${parts[0]}.${parts[1]}.${parts[2]}.255`;
+  } else {
+    // Для других случаев используем /24 по умолчанию
+    return `${parts[0]}.${parts[1]}.${parts[2]}.255`;
+  }
+};

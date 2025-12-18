@@ -385,6 +385,12 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
 
     setAutoDiscovering(true);
     try {
+      // Передаем сохраненный IP, если он есть, для дополнительных прямых запросов
+      const knownIP = savedIp || ipAddress || null;
+      if (knownIP) {
+        console.log(`[ConnectionSetup] Используем сохраненный IP для прямых discovery запросов: ${knownIP}`);
+      }
+
       await discoveryService.startBroadcast((foundIp, foundPort, deviceName) => {
         console.log(`[ConnectionSetup] ========================================`);
         console.log(`[ConnectionSetup] ПОЛУЧЕН КОЛБЭК: ТАБЛО НАЙДЕНО!`);
@@ -417,7 +423,7 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       console.error('[ConnectionSetup] Ошибка при запуске автоматического обнаружения:', error);
       setAutoDiscovering(false);
     }
-  }, [discoveryService, loading, ipAddress]);
+  }, [discoveryService, loading, ipAddress, savedIp]);
 
   /**
    * Подключается к выбранному устройству

@@ -309,6 +309,7 @@ class WebSocketServer {
     this.port = port || getDefaultWebSocketPort();
     this.server = null;
     this.clients = new Map(); // Map<socketId, {socket, isHandshakeComplete, buffer, lastPingTime}>
+    this.disconnectingClients = new Set(); // Set<socketId> - клиенты, которые уже отключаются
     this.onConnectionCallback = null;
     this.onMessageCallback = null;
     this.onDisconnectCallback = null;
@@ -340,6 +341,20 @@ class WebSocketServer {
           try {
             const socketId = `${socket.remoteAddress}:${socket.remotePort}`;
 
+            // Если клиент с таким ID уже существует, отключаем старый
+            const existingClient = this.clients.get(socketId);
+            if (existingClient) {
+              console.log(`[WebSocket] Обнаружено повторное подключение с ${socketId}, отключаем старое соединение`);
+              try {
+                if (existingClient.socket && !existingClient.socket.destroyed) {
+                  existingClient.socket.destroy();
+                }
+              } catch (e) {
+                // Игнорируем ошибки при закрытии старого соединения
+              }
+              this.clients.delete(socketId);
+            }
+
             // Инициализация клиента
             this.clients.set(socketId, {
               socket,
@@ -362,10 +377,25 @@ class WebSocketServer {
 
             socket.on("error", (error) => {
               try {
-                console.error(`[WebSocket] Ошибка сокета ${socketId}:`, error);
+                // Игнорируем ошибки "ECONNRESET" и "EPIPE" - это нормально при резком отключении
+                const errorCode = error.code || '';
+                const errorMessage = error.message || error.toString();
+                if (errorCode === 'ECONNRESET' || errorCode === 'EPIPE' || errorMessage.includes('ECONNRESET') || errorMessage.includes('EPIPE')) {
+                  console.log(`[WebSocket] Клиент ${socketId} отключился (${errorCode})`);
+                } else {
+                  console.error(`[WebSocket] Ошибка сокета ${socketId}:`, error);
+                }
                 this.handleClientDisconnect(socketId);
               } catch (errorHandlerError) {
                 console.error(`[WebSocket] Ошибка при обработке ошибки сокета ${socketId}:`, errorHandlerError);
+                // Удаляем клиента даже при ошибке обработки
+                try {
+                  if (this.clients.has(socketId)) {
+                    this.clients.delete(socketId);
+                  }
+                } catch (e) {
+                  // Игнорируем
+                }
               }
             });
 
@@ -375,6 +405,14 @@ class WebSocketServer {
                 this.handleClientDisconnect(socketId);
               } catch (closeHandlerError) {
                 console.error(`[WebSocket] Ошибка при обработке закрытия сокета ${socketId}:`, closeHandlerError);
+                // Удаляем клиента даже при ошибке обработки
+                try {
+                  if (this.clients.has(socketId)) {
+                    this.clients.delete(socketId);
+                  }
+                } catch (e) {
+                  // Игнорируем
+                }
               }
             });
           } catch (connectionError) {
@@ -432,6 +470,14 @@ class WebSocketServer {
     try {
       const client = this.clients.get(socketId);
       if (!client) {
+        console.warn(`[WebSocket] Получены данные от несуществующего клиента: ${socketId}`);
+        return;
+      }
+
+      // Проверяем, что сокет еще не уничтожен
+      if (client.socket && client.socket.destroyed) {
+        console.warn(`[WebSocket] Получены данные от уничтоженного сокета: ${socketId}`);
+        this.handleClientDisconnect(socketId);
         return;
       }
 
@@ -451,12 +497,16 @@ class WebSocketServer {
 
                 console.log(`[WebSocket] Handshake завершен для ${socketId}`);
 
+                // Вызываем колбэк подключения асинхронно, чтобы не блокировать поток
                 if (this.onConnectionCallback) {
-                  try {
-                    this.onConnectionCallback(socketId);
-                  } catch (callbackError) {
-                    console.error(`[WebSocket] Ошибка в onConnectionCallback для ${socketId}:`, callbackError);
-                  }
+                  setTimeout(() => {
+                    try {
+                      this.onConnectionCallback(socketId);
+                    } catch (callbackError) {
+                      console.error(`[WebSocket] Ошибка в onConnectionCallback для ${socketId}:`, callbackError);
+                      // Не пробрасываем ошибку дальше, чтобы не крашить приложение
+                    }
+                  }, 0);
                 }
               } catch (writeError) {
                 console.error(`[WebSocket] Ошибка при отправке handshake ответа ${socketId}:`, writeError);
@@ -522,16 +572,20 @@ class WebSocketServer {
                   console.log(`[WebSocket] Сообщение от ${socketId}:`, message);
 
                   if (this.onMessageCallback) {
-                    try {
-                      const parsed = JSON.parse(message);
-                      this.onMessageCallback(socketId, parsed);
-                    } catch (e) {
+                    // Вызываем колбэк сообщения асинхронно
+                    setTimeout(() => {
                       try {
-                        this.onMessageCallback(socketId, message);
-                      } catch (callbackError) {
-                        console.error(`[WebSocket] Ошибка в onMessageCallback для ${socketId}:`, callbackError);
+                        const parsed = JSON.parse(message);
+                        this.onMessageCallback(socketId, parsed);
+                      } catch (e) {
+                        try {
+                          this.onMessageCallback(socketId, message);
+                        } catch (callbackError) {
+                          console.error(`[WebSocket] Ошибка в onMessageCallback для ${socketId}:`, callbackError);
+                          // Не пробрасываем ошибку дальше
+                        }
                       }
-                    }
+                    }, 0);
                   }
                 } catch (messageError) {
                   console.error(`[WebSocket] Ошибка при обработке сообщения от ${socketId}:`, messageError);
@@ -596,15 +650,24 @@ class WebSocketServer {
       const client = this.clients.get(socketId);
       if (!client || !client.isHandshakeComplete) {
         console.warn(
-          `[WebSocket] Попытка отправить данные несуществующему клиенту: ${socketId}`
+          `[WebSocket] Попытка отправить данные несуществующему клиенту или без завершенного handshake: ${socketId}`
         );
         return;
       }
 
-      if (!client.socket || client.socket.destroyed) {
+      if (!client.socket) {
+        console.warn(
+          `[WebSocket] Попытка отправить данные на несуществующий сокет: ${socketId}`
+        );
+        this.handleClientDisconnect(socketId);
+        return;
+      }
+
+      if (client.socket.destroyed) {
         console.warn(
           `[WebSocket] Попытка отправить данные на закрытый сокет: ${socketId}`
         );
+        this.handleClientDisconnect(socketId);
         return;
       }
 
@@ -613,10 +676,17 @@ class WebSocketServer {
         const frame = createWebSocketFrame(message, 0x1);
         client.socket.write(frame);
       } catch (error) {
-        console.error(
-          `[WebSocket] Ошибка при отправке данных клиенту ${socketId}:`,
-          error
-        );
+        const errorCode = error.code || '';
+        const errorMessage = error.message || error.toString();
+        // Игнорируем ошибки "EPIPE" и "ECONNRESET" - это нормально при отключении
+        if (errorCode === 'EPIPE' || errorCode === 'ECONNRESET' || errorMessage.includes('EPIPE') || errorMessage.includes('ECONNRESET')) {
+          console.log(`[WebSocket] Клиент ${socketId} отключился во время отправки данных`);
+        } else {
+          console.error(
+            `[WebSocket] Ошибка при отправке данных клиенту ${socketId}:`,
+            error
+          );
+        }
         // Отключаем клиента при ошибке отправки
         this.handleClientDisconnect(socketId);
       }
@@ -625,6 +695,12 @@ class WebSocketServer {
         `[WebSocket] Критическая ошибка при отправке данных клиенту ${socketId}:`,
         error
       );
+      // Пытаемся отключить клиента даже при критической ошибке
+      try {
+        this.handleClientDisconnect(socketId);
+      } catch (e) {
+        // Игнорируем ошибки при отключении
+      }
     }
   }
 
@@ -697,35 +773,87 @@ class WebSocketServer {
    * @param {string} socketId ID сокета
    */
   handleClientDisconnect(socketId) {
+    // Проверяем, что клиент еще существует (может быть уже удален)
+    if (!this.clients.has(socketId)) {
+      return; // Клиент уже удален
+    }
+
+    // Проверяем, что мы не обрабатываем отключение этого клиента уже сейчас
+    if (this.disconnectingClients.has(socketId)) {
+      console.log(`[WebSocket] Отключение клиента ${socketId} уже обрабатывается, пропускаем`);
+      return;
+    }
+
+    // Помечаем клиента как отключающегося
+    this.disconnectingClients.add(socketId);
+
     try {
       const client = this.clients.get(socketId);
       if (client) {
+        // Очищаем буфер
         try {
-          if (client.socket && !client.socket.destroyed) {
-            client.socket.destroy();
+          if (client.buffer) {
+            client.buffer = Buffer.alloc(0);
+          }
+        } catch (e) {
+          // Игнорируем ошибки при очистке буфера
+        }
+
+        // Закрываем сокет безопасно
+        try {
+          if (client.socket) {
+            // Удаляем все обработчики событий перед закрытием
+            try {
+              client.socket.removeAllListeners('data');
+              client.socket.removeAllListeners('error');
+              client.socket.removeAllListeners('close');
+            } catch (e) {
+              // Игнорируем ошибки при удалении обработчиков
+            }
+
+            if (!client.socket.destroyed) {
+              try {
+                client.socket.destroy();
+              } catch (destroyError) {
+                // Игнорируем ошибки при уничтожении сокета
+                console.warn(`[WebSocket] Ошибка при уничтожении сокета ${socketId}:`, destroyError);
+              }
+            }
           }
         } catch (error) {
           // Игнорируем ошибки при закрытии сокета
           console.warn(`[WebSocket] Ошибка при закрытии сокета ${socketId}:`, error);
         }
+
+        // Удаляем клиента из списка ПЕРЕД вызовом колбэка
         this.clients.delete(socketId);
 
-        if (this.onDisconnectCallback) {
-          try {
-            this.onDisconnectCallback(socketId);
-          } catch (callbackError) {
-            console.error(`[WebSocket] Ошибка в onDisconnectCallback для ${socketId}:`, callbackError);
-          }
+        // Вызываем колбэк отключения только если handshake был завершен
+        if (client.isHandshakeComplete && this.onDisconnectCallback) {
+          // Вызываем колбэк асинхронно
+          setTimeout(() => {
+            try {
+              this.onDisconnectCallback(socketId);
+            } catch (callbackError) {
+              console.error(`[WebSocket] Ошибка в onDisconnectCallback для ${socketId}:`, callbackError);
+              // Не пробрасываем ошибку дальше
+            }
+          }, 0);
         }
       }
     } catch (error) {
       console.error(`[WebSocket] Ошибка при обработке отключения клиента ${socketId}:`, error);
       // Удаляем клиента из списка даже при ошибке
       try {
-        this.clients.delete(socketId);
+        if (this.clients.has(socketId)) {
+          this.clients.delete(socketId);
+        }
       } catch (e) {
         // Игнорируем ошибки при удалении
       }
+    } finally {
+      // Удаляем из списка отключающихся клиентов
+      this.disconnectingClients.delete(socketId);
     }
   }
 
@@ -742,22 +870,52 @@ class WebSocketServer {
       }
 
       const now = Date.now();
-      this.clients.forEach((client, socketId) => {
-        if (!client.isHandshakeComplete) {
-          return;
-        }
+      // Создаем копию списка клиентов, чтобы избежать проблем при изменении во время итерации
+      const clientIds = Array.from(this.clients.keys());
 
-        // Проверяем таймаут последнего Pong
-        if (client.lastPongTime && (now - client.lastPongTime) > this.heartbeatTimeoutMs * 2) {
-          console.warn(`[WebSocket] Таймаут heartbeat для клиента ${socketId}, отключаем`);
-          this.handleClientDisconnect(socketId);
-          return;
-        }
+      clientIds.forEach((socketId) => {
+        try {
+          const client = this.clients.get(socketId);
+          if (!client) {
+            // Клиент уже удален, пропускаем
+            return;
+          }
 
-        // Отправляем Ping если еще не отправляли или прошло достаточно времени
-        if (!client.lastPingTime || (now - client.lastPingTime) > this.heartbeatIntervalMs) {
-          this.sendPingFrame(socketId);
-          client.lastPingTime = now;
+          if (!client.isHandshakeComplete) {
+            return;
+          }
+
+          // Проверяем, что сокет еще существует и не уничтожен
+          if (!client.socket || client.socket.destroyed) {
+            console.log(`[WebSocket] Сокет ${socketId} уничтожен, отключаем клиента`);
+            this.handleClientDisconnect(socketId);
+            return;
+          }
+
+          // Проверяем таймаут последнего Pong
+          if (client.lastPongTime && (now - client.lastPongTime) > this.heartbeatTimeoutMs * 2) {
+            console.warn(`[WebSocket] Таймаут heartbeat для клиента ${socketId}, отключаем`);
+            this.handleClientDisconnect(socketId);
+            return;
+          }
+
+          // Отправляем Ping если еще не отправляли или прошло достаточно времени
+          if (!client.lastPingTime || (now - client.lastPingTime) > this.heartbeatIntervalMs) {
+            this.sendPingFrame(socketId);
+            // Обновляем время только если клиент еще существует
+            const updatedClient = this.clients.get(socketId);
+            if (updatedClient) {
+              updatedClient.lastPingTime = now;
+            }
+          }
+        } catch (error) {
+          console.error(`[WebSocket] Ошибка в heartbeat для клиента ${socketId}:`, error);
+          // Пытаемся отключить клиента при ошибке
+          try {
+            this.handleClientDisconnect(socketId);
+          } catch (e) {
+            // Игнорируем ошибки при отключении
+          }
         }
       });
     }, this.heartbeatIntervalMs);
@@ -784,7 +942,13 @@ class WebSocketServer {
         return;
       }
 
-      if (!client.socket || client.socket.destroyed) {
+      if (!client.socket) {
+        // Сокет не существует, удаляем клиента
+        this.handleClientDisconnect(socketId);
+        return;
+      }
+
+      if (client.socket.destroyed) {
         // Сокет закрыт, удаляем клиента
         this.handleClientDisconnect(socketId);
         return;
@@ -795,12 +959,25 @@ class WebSocketServer {
         client.socket.write(frame);
         console.log(`[WebSocket] Отправлен Ping клиенту ${socketId}`);
       } catch (error) {
-        console.error(`[WebSocket] Ошибка при отправке Ping клиенту ${socketId}:`, error);
+        const errorCode = error.code || '';
+        const errorMessage = error.message || error.toString();
+        // Игнорируем ошибки "EPIPE" и "ECONNRESET" - это нормально при отключении
+        if (errorCode === 'EPIPE' || errorCode === 'ECONNRESET' || errorMessage.includes('EPIPE') || errorMessage.includes('ECONNRESET')) {
+          console.log(`[WebSocket] Клиент ${socketId} отключился во время отправки Ping`);
+        } else {
+          console.error(`[WebSocket] Ошибка при отправке Ping клиенту ${socketId}:`, error);
+        }
         // Отключаем клиента при ошибке отправки
         this.handleClientDisconnect(socketId);
       }
     } catch (error) {
       console.error(`[WebSocket] Ошибка в sendPingFrame для ${socketId}:`, error);
+      // Пытаемся отключить клиента даже при ошибке
+      try {
+        this.handleClientDisconnect(socketId);
+      } catch (e) {
+        // Игнорируем ошибки при отключении
+      }
     }
   }
 
@@ -819,10 +996,16 @@ class WebSocketServer {
       this.stopHeartbeat();
 
       // Закрываем все соединения
-      this.clients.forEach((client, socketId) => {
-        this.handleClientDisconnect(socketId);
+      const clientIds = Array.from(this.clients.keys());
+      clientIds.forEach((socketId) => {
+        try {
+          this.handleClientDisconnect(socketId);
+        } catch (e) {
+          // Игнорируем ошибки при отключении
+        }
       });
       this.clients.clear();
+      this.disconnectingClients.clear();
 
       // Закрываем сервер
       if (this.server) {
@@ -861,13 +1044,26 @@ class WebSocketServer {
    * @returns {number}
    */
   getClientCount() {
-    let count = 0;
-    this.clients.forEach((client) => {
-      if (client.isHandshakeComplete) {
-        count++;
+    try {
+      if (!this.clients) {
+        return 0;
       }
-    });
-    return count;
+      let count = 0;
+      this.clients.forEach((client) => {
+        try {
+          if (client && client.isHandshakeComplete) {
+            count++;
+          }
+        } catch (error) {
+          // Игнорируем ошибки при проверке отдельных клиентов
+          console.error('[WebSocket] Ошибка при проверке клиента в getClientCount:', error);
+        }
+      });
+      return count;
+    } catch (error) {
+      console.error('[WebSocket] Ошибка в getClientCount:', error);
+      return 0;
+    }
   }
 
   /**

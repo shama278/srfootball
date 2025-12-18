@@ -52,19 +52,34 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
     websocketClientRef.current = websocketClient;
   }, [websocketClient]);
 
-  // Обновляем ref при изменении WebSocket сервера и статус подключения
+    // Обновляем ref при изменении WebSocket сервера и статус подключения
   useEffect(() => {
     websocketServerRef.current = websocketServer;
     // Обновляем статус подключения для табло на основе количества подключенных контроллеров
     if (!isController && websocketServer) {
       const updateConnectionStatus = () => {
-        if (websocketServer) {
-          const clientCount = websocketServer.getClientCount();
-          const isNowConnected = clientCount > 0;
-          setIsConnected(isNowConnected);
-          console.log(`[ScoreboardContext] Статус подключения обновлен: ${isNowConnected ? 'подключено' : 'не подключено'} (клиентов: ${clientCount})`);
-        } else {
-          setIsConnected(false);
+        try {
+          if (websocketServer) {
+            try {
+              const clientCount = websocketServer.getClientCount();
+              const isNowConnected = clientCount > 0;
+              setIsConnected(isNowConnected);
+              console.log(`[ScoreboardContext] Статус подключения обновлен: ${isNowConnected ? 'подключено' : 'не подключено'} (клиентов: ${clientCount})`);
+            } catch (getCountError) {
+              console.error('[ScoreboardContext] Ошибка при получении количества клиентов:', getCountError);
+              setIsConnected(false);
+            }
+          } else {
+            setIsConnected(false);
+          }
+        } catch (error) {
+          console.error('[ScoreboardContext] Ошибка в updateConnectionStatus:', error);
+          // Устанавливаем статус отключено при ошибке
+          try {
+            setIsConnected(false);
+          } catch (setError) {
+            console.error('[ScoreboardContext] Критическая ошибка при установке статуса:', setError);
+          }
         }
       };
 
@@ -74,27 +89,49 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
 
       // Обновляем колбэки, чтобы сразу обновлять статус при подключении/отключении
       websocketServer.onConnectionCallback = (socketId) => {
-        if (originalOnConnection) {
-          try {
-            originalOnConnection(socketId);
-          } catch (error) {
-            console.error('[ScoreboardContext] Ошибка в оригинальном onConnectionCallback:', error);
+        try {
+          if (originalOnConnection) {
+            try {
+              originalOnConnection(socketId);
+            } catch (error) {
+              console.error('[ScoreboardContext] Ошибка в оригинальном onConnectionCallback:', error);
+            }
           }
+          // Обновляем статус асинхронно, чтобы не блокировать поток
+          setTimeout(() => {
+            try {
+              updateConnectionStatus();
+            } catch (statusError) {
+              console.error('[ScoreboardContext] Ошибка при обновлении статуса подключения:', statusError);
+            }
+          }, 0);
+        } catch (error) {
+          console.error('[ScoreboardContext] Критическая ошибка в onConnectionCallback:', error);
+          // Не пробрасываем ошибку дальше
         }
-        // Немедленно обновляем статус
-        updateConnectionStatus();
       };
 
       websocketServer.onDisconnectCallback = (socketId) => {
-        if (originalOnDisconnect) {
-          try {
-            originalOnDisconnect(socketId);
-          } catch (error) {
-            console.error('[ScoreboardContext] Ошибка в оригинальном onDisconnectCallback:', error);
+        try {
+          if (originalOnDisconnect) {
+            try {
+              originalOnDisconnect(socketId);
+            } catch (error) {
+              console.error('[ScoreboardContext] Ошибка в оригинальном onDisconnectCallback:', error);
+            }
           }
+          // Обновляем статус асинхронно, чтобы не блокировать поток
+          setTimeout(() => {
+            try {
+              updateConnectionStatus();
+            } catch (statusError) {
+              console.error('[ScoreboardContext] Ошибка при обновлении статуса отключения:', statusError);
+            }
+          }, 0);
+        } catch (error) {
+          console.error('[ScoreboardContext] Критическая ошибка в onDisconnectCallback:', error);
+          // Не пробрасываем ошибку дальше
         }
-        // Немедленно обновляем статус
-        updateConnectionStatus();
       };
 
       // Проверяем статус сразу
@@ -441,21 +478,64 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
             // Обрабатываем обновления состояния от контроллера
             if (message && typeof message === 'object' && message.type === 'scoreboard_update' && message.data) {
               try {
-                setState((prev) => {
+                // Используем setTimeout для асинхронного обновления состояния, чтобы не блокировать поток
+                setTimeout(() => {
                   try {
-                    // Проверяем, что данные валидны перед обновлением состояния
-                    if (message.data && typeof message.data === 'object') {
-                      const newState = {...prev, ...message.data};
-                      return newState;
-                    }
-                    return prev;
-                  } catch (stateError) {
-                    console.error('[ScoreboardContext] Ошибка при обновлении состояния:', stateError);
-                    return prev;
+                    setState((prev) => {
+                      try {
+                        // Проверяем, что данные валидны перед обновлением состояния
+                        if (!message || !message.data || typeof message.data !== 'object') {
+                          console.warn('[ScoreboardContext] Некорректные данные сообщения, используем предыдущее состояние');
+                          return prev || initialState;
+                        }
+
+                        // Безопасное объединение состояния с проверкой каждого поля
+                        const safePrev = prev || initialState;
+                        const safeData = message.data || {};
+
+                        const newState = {
+                          ...safePrev,
+                          team1: {
+                            ...(initialState.team1 || {}),
+                            ...(safePrev.team1 || {}),
+                            ...(safeData.team1 && typeof safeData.team1 === 'object' ? safeData.team1 : {}),
+                          },
+                          team2: {
+                            ...(initialState.team2 || {}),
+                            ...(safePrev.team2 || {}),
+                            ...(safeData.team2 && typeof safeData.team2 === 'object' ? safeData.team2 : {}),
+                          },
+                          timer: {
+                            ...(initialState.timer || {}),
+                            ...(safePrev.timer || {}),
+                            ...(safeData.timer && typeof safeData.timer === 'object' ? safeData.timer : {}),
+                          },
+                          period: safeData.period !== undefined && typeof safeData.period === 'number' && safeData.period >= 1
+                            ? safeData.period
+                            : (safePrev.period || initialState.period || 1),
+                          settings: {
+                            ...(initialState.settings || {}),
+                            ...(safePrev.settings || {}),
+                            ...(safeData.settings && typeof safeData.settings === 'object' ? safeData.settings : {}),
+                          },
+                        };
+                        return newState;
+                      } catch (stateError) {
+                        console.error('[ScoreboardContext] Ошибка при обновлении состояния:', stateError);
+                        console.error('[ScoreboardContext] Stack trace:', stateError.stack);
+                        return prev || initialState;
+                      }
+                    });
+                  } catch (setStateError) {
+                    console.error('[ScoreboardContext] КРИТИЧЕСКАЯ ОШИБКА при вызове setState:', setStateError);
+                    console.error('[ScoreboardContext] Stack trace:', setStateError.stack);
+                    // Не пробрасываем ошибку дальше, приложение должно продолжать работать
                   }
-                });
-              } catch (setStateError) {
-                console.error('[ScoreboardContext] Ошибка при вызове setState:', setStateError);
+                }, 0);
+              } catch (error) {
+                console.error('[ScoreboardContext] КРИТИЧЕСКАЯ ОШИБКА при планировании обновления состояния:', error);
+                console.error('[ScoreboardContext] Stack trace:', error.stack);
+                // Не пробрасываем ошибку дальше
               }
             }
           } catch (error) {
@@ -480,45 +560,73 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
         return;
       }
 
-      // Задержка не требуется для обычного режима
-      const connectDelay = 0;
+      // Задержка для обеспечения полной очистки предыдущего соединения
+      const connectDelay = 100;
 
       const connectTimeout = setTimeout(() => {
-        // Проверяем еще раз перед подключением
-        if (!websocketClientRef.current || websocketClientRef.current.getIsConnected()) {
-          console.log('[ScoreboardContext] Клиент уже подключен или не существует, пропускаем');
-          return;
-        }
+        try {
+          // Проверяем еще раз перед подключением
+          if (!websocketClientRef.current) {
+            console.log('[ScoreboardContext] Клиент не существует, пропускаем');
+            return;
+          }
 
-        const handleOpen = () => {
-          console.log('[ScoreboardContext] Контроллер подключен к табло');
-          setIsConnected(true);
-        };
+          if (websocketClientRef.current.getIsConnected()) {
+            console.log('[ScoreboardContext] Клиент уже подключен, пропускаем');
+            return;
+          }
 
-        const handleMessage = (message) => {
-          // Контроллер может получать сообщения от табло (если нужно)
-          console.log('[ScoreboardContext] Сообщение от табло:', message);
-        };
+          const handleOpen = () => {
+            try {
+              console.log('[ScoreboardContext] Контроллер подключен к табло');
+              setIsConnected(true);
+            } catch (error) {
+              console.error('[ScoreboardContext] Ошибка в handleOpen:', error);
+            }
+          };
 
-        const handleError = (error) => {
-          console.error('[ScoreboardContext] Ошибка WebSocket:', error);
+          const handleMessage = (message) => {
+            try {
+              // Контроллер может получать сообщения от табло (если нужно)
+              console.log('[ScoreboardContext] Сообщение от табло:', message);
+            } catch (error) {
+              console.error('[ScoreboardContext] Ошибка в handleMessage:', error);
+            }
+          };
+
+          const handleError = (error) => {
+            try {
+              console.error('[ScoreboardContext] Ошибка WebSocket:', error);
+              setIsConnected(false);
+            } catch (errorHandlerError) {
+              console.error('[ScoreboardContext] Ошибка в handleError:', errorHandlerError);
+            }
+          };
+
+          const handleClose = () => {
+            try {
+              console.log('[ScoreboardContext] Отключен от табло');
+              setIsConnected(false);
+            } catch (error) {
+              console.error('[ScoreboardContext] Ошибка в handleClose:', error);
+            }
+          };
+
+          // Подключаем обработчики
+          if (websocketClientRef.current && !websocketClientRef.current.getIsConnected()) {
+            console.log('[ScoreboardContext] Начинаем подключение к табло...');
+            websocketClientRef.current.connect(handleOpen, handleMessage, handleError, handleClose).catch((error) => {
+              console.error('[ScoreboardContext] Ошибка при подключении к табло:', error);
+              setIsConnected(false);
+              // Не пробрасываем ошибку дальше, чтобы не крашить приложение
+            });
+          } else {
+            console.log('[ScoreboardContext] Клиент уже подключен, пропускаем');
+          }
+        } catch (error) {
+          console.error('[ScoreboardContext] Критическая ошибка при инициализации подключения:', error);
           setIsConnected(false);
-
-        };
-
-        const handleClose = () => {
-          console.log('[ScoreboardContext] Отключен от табло');
-          setIsConnected(false);
-        };
-
-        // Подключаем обработчики
-        if (websocketClientRef.current && !websocketClientRef.current.getIsConnected()) {
-          console.log('[ScoreboardContext] Начинаем подключение к табло...');
-          websocketClientRef.current.connect(handleOpen, handleMessage, handleError, handleClose).catch((error) => {
-            console.error('[ScoreboardContext] Ошибка при подключении к табло:', error);
-          });
-        } else {
-          console.log('[ScoreboardContext] Клиент уже подключен, пропускаем');
+          // Не пробрасываем ошибку дальше
         }
       }, connectDelay);
 
@@ -550,104 +658,337 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
     }
 
     const interval = setInterval(() => {
-      setState((prev) => {
-        if (!prev.timer.isRunning) {
-          return prev;
-        }
+      try {
+        setState((prev) => {
+          try {
+            if (!prev || !prev.timer || !prev.timer.isRunning) {
+              return prev || initialState;
+            }
 
-        let {minutes, seconds} = prev.timer;
+            let {minutes, seconds} = prev.timer;
 
-        if (seconds > 0) {
-          seconds--;
-        } else if (minutes > 0) {
-          minutes--;
-          seconds = 59;
-        } else {
-          // Таймер достиг нуля
-          return {
-            ...prev,
-            timer: {
-              ...prev.timer,
-              isRunning: false,
-            },
-          };
-        }
+            if (seconds > 0) {
+              seconds--;
+            } else if (minutes > 0) {
+              minutes--;
+              seconds = 59;
+            } else {
+              // Таймер достиг нуля
+              return {
+                ...prev,
+                timer: {
+                  ...prev.timer,
+                  isRunning: false,
+                },
+              };
+            }
 
-        const updates = {
-          timer: {
-            ...prev.timer,
-            minutes,
-            seconds,
-          },
-        };
+            const updates = {
+              timer: {
+                ...prev.timer,
+                minutes,
+                seconds,
+              },
+            };
 
-        const newState = {...prev, ...updates};
+            const newState = {...prev, ...updates};
 
-        if (isController) {
-          saveState(newState);
-          broadcastUpdate(updates);
-        }
+            if (isController) {
+              try {
+                saveState(newState);
+                broadcastUpdate(updates);
+              } catch (saveError) {
+                console.error('[ScoreboardContext] Ошибка при сохранении состояния таймера:', saveError);
+              }
+            }
 
-        return newState;
-      });
+            return newState;
+          } catch (error) {
+            console.error('[ScoreboardContext] Ошибка в setState таймера:', error);
+            return prev || initialState;
+          }
+        });
+      } catch (error) {
+        console.error('[ScoreboardContext] Критическая ошибка в интервале таймера:', error);
+        // Не останавливаем интервал, продолжаем работу
+      }
     }, 1000);
 
     return () => clearInterval(interval);
   }, [state.timer.isRunning, isController]);
 
+  // Обертываем все методы в безопасные обертки
+  const safeUpdateTeam1Score = useCallback((delta) => {
+    try {
+      updateTeam1Score(delta);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam1Score:', error);
+    }
+  }, [updateTeam1Score]);
+
+  const safeUpdateTeam2Score = useCallback((delta) => {
+    try {
+      updateTeam2Score(delta);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam2Score:', error);
+    }
+  }, [updateTeam2Score]);
+
+  const safeSetTeam1Score = useCallback((score) => {
+    try {
+      setTeam1Score(score);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в setTeam1Score:', error);
+    }
+  }, [setTeam1Score]);
+
+  const safeSetTeam2Score = useCallback((score) => {
+    try {
+      setTeam2Score(score);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в setTeam2Score:', error);
+    }
+  }, [setTeam2Score]);
+
+  const safeUpdateTeam1Name = useCallback((name) => {
+    try {
+      updateTeam1Name(name);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam1Name:', error);
+    }
+  }, [updateTeam1Name]);
+
+  const safeUpdateTeam2Name = useCallback((name) => {
+    try {
+      updateTeam2Name(name);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam2Name:', error);
+    }
+  }, [updateTeam2Name]);
+
+  const safeUpdateTeam1Logo = useCallback((logo) => {
+    try {
+      updateTeam1Logo(logo);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam1Logo:', error);
+    }
+  }, [updateTeam1Logo]);
+
+  const safeUpdateTeam2Logo = useCallback((logo) => {
+    try {
+      updateTeam2Logo(logo);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTeam2Logo:', error);
+    }
+  }, [updateTeam2Logo]);
+
+  const safeUpdateTimer = useCallback((timerUpdates) => {
+    try {
+      updateTimer(timerUpdates);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateTimer:', error);
+    }
+  }, [updateTimer]);
+
+  const safeSetTimer = useCallback((minutes, seconds) => {
+    try {
+      setTimer(minutes, seconds);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в setTimer:', error);
+    }
+  }, [setTimer]);
+
+  const safeStartTimer = useCallback(() => {
+    try {
+      startTimer();
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в startTimer:', error);
+    }
+  }, [startTimer]);
+
+  const safeStopTimer = useCallback(() => {
+    try {
+      stopTimer();
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в stopTimer:', error);
+    }
+  }, [stopTimer]);
+
+  const safeResetTimer = useCallback(() => {
+    try {
+      resetTimer();
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в resetTimer:', error);
+    }
+  }, [resetTimer]);
+
+  const safeUpdatePeriod = useCallback((period) => {
+    try {
+      updatePeriod(period);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updatePeriod:', error);
+    }
+  }, [updatePeriod]);
+
+  const safeUpdateSettings = useCallback((settings) => {
+    try {
+      updateSettings(settings);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateSettings:', error);
+    }
+  }, [updateSettings]);
+
+  const safeUpdateState = useCallback((updates, shouldBroadcast = true) => {
+    try {
+      updateState(updates, shouldBroadcast);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в updateState:', error);
+    }
+  }, [updateState]);
+
+  const safeResetScoreboard = useCallback(() => {
+    try {
+      resetScoreboard();
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в resetScoreboard:', error);
+    }
+  }, [resetScoreboard]);
+
+  const safeLoadState = useCallback(async () => {
+    try {
+      return await loadState();
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в loadState:', error);
+      return null;
+    }
+  }, [loadState]);
+
+  const safeSaveState = useCallback(async (newState) => {
+    try {
+      await saveState(newState);
+    } catch (error) {
+      console.error('[ScoreboardContext] Ошибка в saveState:', error);
+    }
+  }, [saveState]);
+
   const value = {
     // Состояние
-    state,
+    state: state || initialState,
     isConnected,
 
     // Методы обновления счета
-    updateTeam1Score,
-    updateTeam2Score,
-    setTeam1Score,
-    setTeam2Score,
+    updateTeam1Score: safeUpdateTeam1Score,
+    updateTeam2Score: safeUpdateTeam2Score,
+    setTeam1Score: safeSetTeam1Score,
+    setTeam2Score: safeSetTeam2Score,
 
     // Методы обновления команд
-    updateTeam1Name,
-    updateTeam2Name,
-    updateTeam1Logo,
-    updateTeam2Logo,
+    updateTeam1Name: safeUpdateTeam1Name,
+    updateTeam2Name: safeUpdateTeam2Name,
+    updateTeam1Logo: safeUpdateTeam1Logo,
+    updateTeam2Logo: safeUpdateTeam2Logo,
 
     // Методы работы с таймером
-    updateTimer,
-    setTimer,
-    startTimer,
-    stopTimer,
-    resetTimer,
+    updateTimer: safeUpdateTimer,
+    setTimer: safeSetTimer,
+    startTimer: safeStartTimer,
+    stopTimer: safeStopTimer,
+    resetTimer: safeResetTimer,
 
     // Методы работы с периодом
-    updatePeriod,
+    updatePeriod: safeUpdatePeriod,
 
     // Методы работы с настройками
-    updateSettings,
+    updateSettings: safeUpdateSettings,
 
     // Общие методы
-    updateState,
-    resetScoreboard,
-    loadState,
-    saveState,
+    updateState: safeUpdateState,
+    resetScoreboard: safeResetScoreboard,
+    loadState: safeLoadState,
+    saveState: safeSaveState,
   };
 
-  return (
-    <ScoreboardContext.Provider value={value}>
-      {children}
-    </ScoreboardContext.Provider>
-  );
+  try {
+    return (
+      <ScoreboardContext.Provider value={value}>
+        {children}
+      </ScoreboardContext.Provider>
+    );
+  } catch (error) {
+    console.error('[ScoreboardContext] КРИТИЧЕСКАЯ ОШИБКА при рендеринге провайдера:', error);
+    // Возвращаем минимальный провайдер с начальным состоянием
+    return (
+      <ScoreboardContext.Provider value={{state: initialState, isConnected: false}}>
+        {children}
+      </ScoreboardContext.Provider>
+    );
+  }
 };
 
 /**
  * Хук для использования контекста табло
  */
 export const useScoreboard = () => {
-  const context = useContext(ScoreboardContext);
-  if (!context) {
-    throw new Error('useScoreboard должен использоваться внутри ScoreboardProvider');
+  try {
+    const context = useContext(ScoreboardContext);
+    if (!context) {
+      console.error('[useScoreboard] Контекст не найден, возвращаем начальное состояние');
+      // Возвращаем начальное состояние вместо выброса ошибки
+      return {
+        state: initialState,
+        isConnected: false,
+        // Пустые функции-заглушки
+        updateTeam1Score: () => {},
+        updateTeam2Score: () => {},
+        setTeam1Score: () => {},
+        setTeam2Score: () => {},
+        updateTeam1Name: () => {},
+        updateTeam2Name: () => {},
+        updateTeam1Logo: () => {},
+        updateTeam2Logo: () => {},
+        updateTimer: () => {},
+        setTimer: () => {},
+        startTimer: () => {},
+        stopTimer: () => {},
+        resetTimer: () => {},
+        updatePeriod: () => {},
+        updateSettings: () => {},
+        updateState: () => {},
+        resetScoreboard: () => {},
+        loadState: async () => null,
+        saveState: async () => {},
+      };
+    }
+    return context;
+  } catch (error) {
+    console.error('[useScoreboard] КРИТИЧЕСКАЯ ОШИБКА:', error);
+    console.error('[useScoreboard] Stack trace:', error.stack);
+    // Возвращаем начальное состояние вместо выброса ошибки
+    return {
+      state: initialState,
+      isConnected: false,
+      // Пустые функции-заглушки
+      updateTeam1Score: () => {},
+      updateTeam2Score: () => {},
+      setTeam1Score: () => {},
+      setTeam2Score: () => {},
+      updateTeam1Name: () => {},
+      updateTeam2Name: () => {},
+      updateTeam1Logo: () => {},
+      updateTeam2Logo: () => {},
+      updateTimer: () => {},
+      setTimer: () => {},
+      startTimer: () => {},
+      stopTimer: () => {},
+      resetTimer: () => {},
+      updatePeriod: () => {},
+      updateSettings: () => {},
+      updateState: () => {},
+      resetScoreboard: () => {},
+      loadState: async () => null,
+      saveState: async () => {},
+    };
   }
-  return context;
 };
 
 export default ScoreboardContext;

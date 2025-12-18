@@ -10,6 +10,50 @@ import WebSocketClient from './services/websocketClient';
 import DiscoveryService from './services/discoveryService';
 import {getLocalIPAddress, getDefaultWebSocketPort} from './services/networkUtils';
 import {APP_MODES} from './utils/deviceDetection';
+import ErrorBoundary from './components/ErrorBoundary';
+
+// Глобальная обработка необработанных ошибок
+if (typeof ErrorUtils !== 'undefined') {
+  const originalGlobalHandler = ErrorUtils.getGlobalHandler();
+  ErrorUtils.setGlobalHandler((error, isFatal) => {
+    console.error('[App] ГЛОБАЛЬНАЯ НЕОБРАБОТАННАЯ ОШИБКА:', error);
+    console.error('[App] Фатальная:', isFatal);
+    console.error('[App] Stack trace:', error.stack);
+
+    // Вызываем оригинальный обработчик, но не крашим приложение
+    if (originalGlobalHandler) {
+      try {
+        originalGlobalHandler(error, isFatal);
+      } catch (handlerError) {
+        console.error('[App] Ошибка в глобальном обработчике ошибок:', handlerError);
+      }
+    }
+
+    // НЕ крашим приложение, продолжаем работу
+    // React Native по умолчанию крашит приложение при фатальных ошибках
+    // Мы перехватываем это и продолжаем работу
+  });
+}
+
+// Обработка необработанных промисов
+if (typeof global !== 'undefined' && global.Promise) {
+  const originalUnhandledRejection = global.onunhandledrejection;
+  global.onunhandledrejection = (event) => {
+    console.error('[App] НЕОБРАБОТАННОЕ ОТКЛОНЕНИЕ ПРОМИСА:', event.reason);
+    console.error('[App] Stack trace:', event.reason?.stack);
+
+    // Предотвращаем краш приложения
+    event.preventDefault();
+
+    if (originalUnhandledRejection) {
+      try {
+        originalUnhandledRejection(event);
+      } catch (handlerError) {
+        console.error('[App] Ошибка в обработчике отклоненных промисов:', handlerError);
+      }
+    }
+  };
+}
 
 const App = () => {
   const [mode, setMode] = useState(null);
@@ -61,16 +105,65 @@ const App = () => {
       const server = new WebSocketServer();
       const ipAddress = await server.start(
         (socketId) => {
-          console.log(`[App] Контроллер подключен к табло: ${socketId}`);
-          console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+          try {
+            // Вызываем асинхронно, чтобы не блокировать поток и не вызывать ошибки во время рендеринга
+            setTimeout(() => {
+              try {
+                console.log(`[App] Контроллер подключен к табло: ${socketId}`);
+                try {
+                  const count = server.getClientCount();
+                  console.log(`[App] Всего подключенных контроллеров: ${count}`);
+                } catch (countError) {
+                  console.error(`[App] Ошибка при получении количества клиентов:`, countError);
+                }
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике подключения для ${socketId}:`, error);
+                // Не пробрасываем ошибку дальше
+              }
+            }, 0);
+          } catch (error) {
+            console.error(`[App] Критическая ошибка в обработчике подключения для ${socketId}:`, error);
+            // Не пробрасываем ошибку дальше
+          }
         },
         (socketId, message) => {
-          console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
-          // Сообщения обрабатываются в ScoreboardContext
+          try {
+            // Вызываем асинхронно
+            setTimeout(() => {
+              try {
+                console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
+                // Сообщения обрабатываются в ScoreboardContext
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике сообщений для ${socketId}:`, error);
+                // Не пробрасываем ошибку дальше
+              }
+            }, 0);
+          } catch (error) {
+            console.error(`[App] Критическая ошибка в обработчике сообщений для ${socketId}:`, error);
+            // Не пробрасываем ошибку дальше
+          }
         },
         (socketId) => {
-          console.log(`[App] Контроллер отключен от табло: ${socketId}`);
-          console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+          try {
+            // Вызываем асинхронно
+            setTimeout(() => {
+              try {
+                console.log(`[App] Контроллер отключен от табло: ${socketId}`);
+                try {
+                  const count = server.getClientCount();
+                  console.log(`[App] Всего подключенных контроллеров: ${count}`);
+                } catch (countError) {
+                  console.error(`[App] Ошибка при получении количества клиентов:`, countError);
+                }
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике отключения для ${socketId}:`, error);
+                // Не пробрасываем ошибку дальше
+              }
+            }, 0);
+          } catch (error) {
+            console.error(`[App] Критическая ошибка в обработчике отключения для ${socketId}:`, error);
+            // Не пробрасываем ошибку дальше
+          }
         }
       );
       console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
@@ -78,8 +171,15 @@ const App = () => {
 
       // Запускаем ответы на discovery запросы от контроллеров
       if (ipAddress) {
+        console.log(`[App] ========================================`);
+        console.log(`[App] Запуск discovery сервиса для табло...`);
+        console.log(`[App] IP адрес табло: ${ipAddress}`);
+        console.log(`[App] Порт WebSocket: ${getDefaultWebSocketPort()}`);
+        console.log(`[App] ========================================`);
         discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
         console.log(`[App] Discovery ответы запущены для табло`);
+      } else {
+        console.error(`[App] ОШИБКА: IP адрес табло не определен! Discovery не запущен!`);
       }
 
       // Дополнительная задержка, чтобы сервер точно был готов принимать подключения
@@ -99,21 +199,41 @@ const App = () => {
           const server = new WebSocketServer();
           const ipAddress = await server.start(
             (socketId) => {
-              console.log(`[App] Контроллер подключен к табло: ${socketId}`);
-              console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+              try {
+                console.log(`[App] Контроллер подключен к табло: ${socketId}`);
+                console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике подключения для ${socketId}:`, error);
+              }
             },
             (socketId, message) => {
-              console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
+              try {
+                console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике сообщений для ${socketId}:`, error);
+              }
             },
             (socketId) => {
-              console.log(`[App] Контроллер отключен от табло: ${socketId}`);
-              console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+              try {
+                console.log(`[App] Контроллер отключен от табло: ${socketId}`);
+                console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
+              } catch (error) {
+                console.error(`[App] Ошибка в обработчике отключения для ${socketId}:`, error);
+              }
             }
           );
           console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
           setWebsocketServer(server);
           if (ipAddress) {
+            console.log(`[App] ========================================`);
+            console.log(`[App] Запуск discovery сервиса для табло (повторная попытка)...`);
+            console.log(`[App] IP адрес табло: ${ipAddress}`);
+            console.log(`[App] Порт WebSocket: ${getDefaultWebSocketPort()}`);
+            console.log(`[App] ========================================`);
             discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
+            console.log(`[App] Discovery ответы запущены для табло (повторная попытка)`);
+          } else {
+            console.error(`[App] ОШИБКА: IP адрес табло не определен! Discovery не запущен!`);
           }
           return true;
         } catch (retryError) {
@@ -148,6 +268,18 @@ const App = () => {
 
   const handleConnectToDisplay = async (displayIP) => {
     try {
+      // Отключаем старый клиент перед созданием нового
+      if (websocketClient) {
+        console.log('[App] Отключаем старый WebSocket клиент перед созданием нового');
+        try {
+          websocketClient.disconnect();
+        } catch (disconnectError) {
+          console.error('[App] Ошибка при отключении старого клиента:', disconnectError);
+        }
+        // Даем время на полное закрытие соединения
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
       const port = getDefaultWebSocketPort();
       // Получаем локальный IP адрес для принудительного использования IPv4
       const localIP = await getLocalIPAddress();
@@ -179,17 +311,23 @@ const App = () => {
   };
 
   if (!mode) {
-    return <ModeSelectorScreen onModeSelected={handleModeSelected} />;
+    return (
+      <ErrorBoundary>
+        <ModeSelectorScreen onModeSelected={handleModeSelected} />
+      </ErrorBoundary>
+    );
   }
 
   if (showConnectionSetup && mode === APP_MODES.CONTROLLER) {
     return (
-      <ConnectionSetupScreen
-        onConnect={handleConnectToDisplay}
-        onCancel={handleCancelConnection}
-        discoveryService={discoveryService}
-        isController={true}
-      />
+      <ErrorBoundary>
+        <ConnectionSetupScreen
+          onConnect={handleConnectToDisplay}
+          onCancel={handleCancelConnection}
+          discoveryService={discoveryService}
+          isController={true}
+        />
+      </ErrorBoundary>
     );
   }
 
@@ -214,21 +352,65 @@ const App = () => {
     );
   }
 
-  return (
-    <ScoreboardProvider
-      websocketClient={websocketClient}
-      websocketServer={websocketServer}
-      isController={isController}>
+  try {
+    return (
+      <ErrorBoundary>
+        <ScoreboardProvider
+          websocketClient={websocketClient}
+          websocketServer={websocketServer}
+          isController={isController}>
+          <SafeAreaView style={styles.container}>
+            <StatusBar barStyle={isController ? 'dark-content' : 'light-content'} />
+            {isController ? (
+              <ControllerScreen onModeChange={() => {
+                try {
+                  setMode(null);
+                } catch (error) {
+                  console.error('[App] Ошибка при изменении режима:', error);
+                }
+              }} />
+            ) : (
+              <DisplayScreen onModeChange={() => {
+                try {
+                  setMode(null);
+                } catch (error) {
+                  console.error('[App] Ошибка при изменении режима:', error);
+                }
+              }} />
+            )}
+          </SafeAreaView>
+        </ScoreboardProvider>
+      </ErrorBoundary>
+    );
+  } catch (error) {
+    console.error('[App] КРИТИЧЕСКАЯ ОШИБКА при рендеринге App:', error);
+    console.error('[App] Stack trace:', error.stack);
+    return (
       <SafeAreaView style={styles.container}>
-        <StatusBar barStyle={isController ? 'dark-content' : 'light-content'} />
-        {isController ? (
-          <ControllerScreen onModeChange={() => setMode(null)} />
-        ) : (
-          <DisplayScreen onModeChange={() => setMode(null)} />
-        )}
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorText}>Критическая ошибка приложения</Text>
+          <Text style={styles.errorDetails}>{error.toString()}</Text>
+          {error.stack && (
+            <Text style={[styles.errorDetails, {fontSize: 10, maxHeight: 200}]} numberOfLines={20}>
+              {error.stack}
+            </Text>
+          )}
+          <TouchableOpacity
+            style={styles.errorButton}
+            onPress={() => {
+              try {
+                setMode(null);
+                setError(null);
+              } catch (resetError) {
+                console.error('[App] Ошибка при сбросе:', resetError);
+              }
+            }}>
+            <Text style={styles.errorButtonText}>Перезапустить</Text>
+          </TouchableOpacity>
+        </View>
       </SafeAreaView>
-    </ScoreboardProvider>
-  );
+    );
+  }
 };
 
 const styles = StyleSheet.create({
@@ -246,6 +428,15 @@ const styles = StyleSheet.create({
     color: '#ff0000',
     marginBottom: 20,
     textAlign: 'center',
+    fontWeight: 'bold',
+  },
+  errorDetails: {
+    fontSize: 12,
+    color: '#ffffff',
+    marginBottom: 20,
+    textAlign: 'center',
+    fontFamily: 'monospace',
+    maxHeight: 200,
   },
   errorButton: {
     backgroundColor: '#2196f3',

@@ -1,4 +1,4 @@
-import {getLocalIPAddress, getDefaultWebSocketPort} from './networkUtils';
+import {getLocalIPAddress, getDefaultWebSocketPort, getBroadcastAddress} from './networkUtils';
 import {Platform} from 'react-native';
 import {Buffer} from 'buffer';
 
@@ -53,12 +53,44 @@ class DiscoveryService {
   }
 
   /**
+   * Отправляет discovery запрос на конкретный IP адрес (для тестирования)
+   * @param {string} targetIP IP адрес для отправки запроса
+   */
+  sendDiscoveryToIP(targetIP) {
+    if (!this.broadcastSocket || !this.isBroadcasting) {
+      console.warn(`[Discovery] Контроллер: не могу отправить запрос на ${targetIP}, broadcast не запущен`);
+      return;
+    }
+
+    try {
+      const buffer = Buffer.from(DISCOVERY_MESSAGE, 'utf8');
+      this.broadcastSocket.send(
+        buffer,
+        0,
+        buffer.length,
+        DISCOVERY_PORT,
+        targetIP,
+        (err) => {
+          if (err) {
+            console.error(`[Discovery] Контроллер: ошибка при отправке discovery запроса на ${targetIP}:${DISCOVERY_PORT}:`, err);
+          } else {
+            console.log(`[Discovery] Контроллер: отправлен discovery запрос на конкретный IP ${targetIP}:${DISCOVERY_PORT}`);
+          }
+        }
+      );
+    } catch (error) {
+      console.error(`[Discovery] Контроллер: ошибка при отправке на ${targetIP}:`, error);
+    }
+  }
+
+  /**
    * Запускает broadcast для контроллера (ищет табло)
    * Контроллер отправляет "SRFOOTBALL_DISCOVERY" и слушает ответы "SRFOOTBALL_HERE:..."
    * @param {Function} onDeviceFound Колбэк при обнаружении табло (ip, port, deviceName)
+   * @param {string|null} knownIP Известный IP адрес табло (для дополнительной отправки запросов)
    * @returns {Promise<void>}
    */
-  startBroadcast(onDeviceFound) {
+  startBroadcast(onDeviceFound, knownIP = null) {
     if (this.isBroadcasting) {
       return Promise.resolve();
     }
@@ -91,6 +123,22 @@ class DiscoveryService {
 
           console.log(`[Discovery] Контроллер: запущен broadcast для поиска табло`);
 
+          // Вычисляем broadcast адрес сети
+          const broadcastAddresses = ['255.255.255.255']; // Всегда отправляем на глобальный broadcast
+          if (this.localIP) {
+            const computedBroadcast = getBroadcastAddress(this.localIP);
+            if (computedBroadcast && !broadcastAddresses.includes(computedBroadcast)) {
+              broadcastAddresses.push(computedBroadcast);
+              console.log(`[Discovery] Контроллер: вычислен broadcast адрес сети: ${computedBroadcast} (из локального IP ${this.localIP})`);
+            }
+          }
+          // Если известен IP табло, добавляем его для прямых запросов
+          if (knownIP && !broadcastAddresses.includes(knownIP)) {
+            broadcastAddresses.push(knownIP);
+            console.log(`[Discovery] Контроллер: добавлен известный IP табло для прямых запросов: ${knownIP}`);
+          }
+          console.log(`[Discovery] Контроллер: будет отправлять на ${broadcastAddresses.length} адрес(ов): ${broadcastAddresses.join(', ')}`);
+
           // Отправляем discovery запросы периодически
           let requestCount = 0;
           this.broadcastInterval = setInterval(() => {
@@ -101,52 +149,56 @@ class DiscoveryService {
             requestCount++;
             // Логируем только каждое 10-е сообщение, чтобы не засорять логи
             if (requestCount % 10 === 0) {
-              console.log(`[Discovery] Контроллер: отправлено ${requestCount} discovery запросов, ответов пока нет`);
+              console.log(`[Discovery] Контроллер: отправлено ${requestCount} discovery запросов (на ${broadcastAddresses.length} адрес(ов)), ответов пока нет`);
             }
             const buffer = Buffer.from(message, 'utf8');
 
-            // Отправляем на broadcast адрес
-            try {
-              this.broadcastSocket.send(
-                buffer,
-                0,
-                buffer.length,
-                DISCOVERY_PORT,
-                '255.255.255.255',
-                (err) => {
-                  if (err) {
-                    console.error('[Discovery] Контроллер: ошибка при отправке discovery запроса:', err);
+            // Отправляем на все broadcast адреса для максимальной надежности
+            broadcastAddresses.forEach((broadcastAddress) => {
+              try {
+                this.broadcastSocket.send(
+                  buffer,
+                  0,
+                  buffer.length,
+                  DISCOVERY_PORT,
+                  broadcastAddress,
+                  (err) => {
+                    if (err) {
+                      console.error(`[Discovery] Контроллер: ошибка при отправке discovery запроса на ${broadcastAddress}:${DISCOVERY_PORT}:`, err);
+                    }
+                    // Убираем успешное логирование, чтобы не засорять логи
                   }
-                  // Убираем успешное логирование, чтобы не засорять логи
-                }
-              );
-            } catch (error) {
-              console.error('[Discovery] Контроллер: ошибка при отправке:', error);
-            }
+                );
+              } catch (error) {
+                console.error(`[Discovery] Контроллер: ошибка при отправке на ${broadcastAddress}:`, error);
+              }
+            });
           }, DISCOVERY_INTERVAL);
 
-          // Отправляем сразу при запуске
-          console.log(`[Discovery] Контроллер: отправка первого discovery запроса...`);
+          // Отправляем сразу при запуске на все адреса
+          console.log(`[Discovery] Контроллер: отправка первого discovery запроса на ${broadcastAddresses.length} адрес(ов)...`);
           if (this.broadcastSocket) {
-            try {
-              const initialBuffer = Buffer.from(DISCOVERY_MESSAGE, 'utf8');
-              this.broadcastSocket.send(
-                initialBuffer,
-                0,
-                initialBuffer.length,
-                DISCOVERY_PORT,
-                '255.255.255.255',
-                (err) => {
-                  if (err) {
-                    console.error('[Discovery] Контроллер: ошибка при отправке начального discovery запроса:', err);
-                  } else {
-                    console.log('[Discovery] Контроллер: отправлен начальный discovery запрос');
+            const initialBuffer = Buffer.from(DISCOVERY_MESSAGE, 'utf8');
+            broadcastAddresses.forEach((broadcastAddress) => {
+              try {
+                this.broadcastSocket.send(
+                  initialBuffer,
+                  0,
+                  initialBuffer.length,
+                  DISCOVERY_PORT,
+                  broadcastAddress,
+                  (err) => {
+                    if (err) {
+                      console.error(`[Discovery] Контроллер: ошибка при отправке начального discovery запроса на ${broadcastAddress}:${DISCOVERY_PORT}:`, err);
+                    } else {
+                      console.log(`[Discovery] Контроллер: отправлен начальный discovery запрос на ${broadcastAddress}:${DISCOVERY_PORT}`);
+                    }
                   }
-                }
-              );
-            } catch (error) {
-              console.error('[Discovery] Контроллер: ошибка при отправке начального запроса:', error);
-            }
+                );
+              } catch (error) {
+                console.error(`[Discovery] Контроллер: ошибка при отправке начального запроса на ${broadcastAddress}:`, error);
+              }
+            });
           }
 
           resolve();
@@ -311,16 +363,22 @@ class DiscoveryService {
             const buffer = Buffer.from(msg);
             const messageStr = buffer.toString('utf8').trim();
 
-            console.log(`[Discovery] Табло: получено сообщение от ${rinfo.address}:${rinfo.port}: "${messageStr}"`);
+            console.log(`[Discovery] ========================================`);
+            console.log(`[Discovery] Табло: получено UDP сообщение!`);
+            console.log(`[Discovery] Табло: от ${rinfo.address}:${rinfo.port}`);
+            console.log(`[Discovery] Табло: содержимое: "${messageStr}"`);
+            console.log(`[Discovery] Табло: длина: ${buffer.length} байт`);
+            console.log(`[Discovery] ========================================`);
 
             // Проверяем discovery запрос
             if (messageStr === DISCOVERY_MESSAGE) {
-              console.log(`[Discovery] Табло: получен discovery запрос от ${rinfo.address}:${rinfo.port}`);
+              console.log(`[Discovery] Табло: ✓ Это discovery запрос! Отвечаем...`);
+              console.log(`[Discovery] Табло: IP контроллера: ${rinfo.address}, порт: ${rinfo.port}`);
 
               // Отвечаем на запрос
               this.sendResponse(rinfo.address, rinfo.port, serverIP, serverPort);
             } else {
-              console.log(`[Discovery] Табло: неизвестное сообщение: "${messageStr}"`);
+              console.log(`[Discovery] Табло: ✗ Неизвестное сообщение (ожидали "${DISCOVERY_MESSAGE}")`);
             }
           } catch (error) {
             console.error('[Discovery] Табло: ошибка при обработке запроса:', error);
@@ -344,8 +402,11 @@ class DiscoveryService {
         }
         this.isResponding = true;
 
+        console.log(`[Discovery] ========================================`);
         console.log(`[Discovery] Табло: начато прослушивание discovery запросов на порту ${DISCOVERY_PORT}`);
         console.log(`[Discovery] Табло: будет отвечать с IP ${serverIP} и портом ${serverPort}`);
+        console.log(`[Discovery] Табло: сокет привязан к 0.0.0.0:${DISCOVERY_PORT}`);
+        console.log(`[Discovery] ========================================`);
       });
 
       // Обработчики уже установлены выше, перед bind
@@ -451,13 +512,16 @@ class DiscoveryService {
    * Останавливает broadcast (контроллер)
    */
   stopBroadcast() {
+    console.log('[Discovery] Контроллер: остановка broadcast...');
     if (this.broadcastInterval) {
       clearInterval(this.broadcastInterval);
       this.broadcastInterval = null;
+      console.log('[Discovery] Контроллер: интервал broadcast остановлен');
     }
 
     if (this.broadcastSocket) {
       try {
+        console.log('[Discovery] Контроллер: закрытие broadcast сокета...');
         this.broadcastSocket.close();
       } catch (error) {
         console.error('[Discovery] Ошибка при закрытии broadcast сокета:', error);
@@ -467,6 +531,7 @@ class DiscoveryService {
 
     if (this.listenSocket) {
       try {
+        console.log('[Discovery] Контроллер: закрытие listen сокета...');
         this.listenSocket.close();
       } catch (error) {
         console.error('[Discovery] Ошибка при закрытии listen сокета:', error);
@@ -475,6 +540,7 @@ class DiscoveryService {
     }
 
     this.isBroadcasting = false;
+    console.log('[Discovery] Контроллер: broadcast остановлен');
   }
 
   /**

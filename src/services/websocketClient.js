@@ -331,9 +331,12 @@ class WebSocketClient {
    * @returns {Promise<void>}
    */
   async connect(onOpen, onMessage, onError, onClose) {
-    if (this.isConnected) {
-      console.warn('[WebSocket Client] Уже подключен');
-      return;
+    // Если уже подключены, сначала отключаемся
+    if (this.isConnected || this.socket) {
+      console.warn('[WebSocket Client] Обнаружено существующее соединение, отключаем перед повторным подключением');
+      this.disconnect();
+      // Даем время на полное закрытие соединения
+      await new Promise(resolve => setTimeout(resolve, 200));
     }
 
     this.onOpenCallback = onOpen;
@@ -343,6 +346,20 @@ class WebSocketClient {
 
     return new Promise((resolve, reject) => {
       try {
+        // Убеждаемся, что старое соединение полностью очищено
+        if (this.socket) {
+          try {
+            this.socket.destroy();
+          } catch (e) {
+            // Игнорируем ошибки при закрытии
+          }
+          this.socket = null;
+        }
+        this.isConnected = false;
+        this.isHandshakeComplete = false;
+        this.buffer = Buffer.alloc(0);
+        this.reconnectAttempts = 0;
+
         // Генерируем ключ для handshake
         this.webSocketKey = generateWebSocketKey();
         this.expectedAcceptKey = null;
@@ -392,49 +409,80 @@ class WebSocketClient {
           this.socket = TcpSocket.createConnection(
             connectionOptions,
             () => {
-              clearTimeout(connectionTimeout);
-              console.log(`[WebSocket Client] TCP соединение установлено с ${this.host}:${this.port}`);
+              try {
+                clearTimeout(connectionTimeout);
+                console.log(`[WebSocket Client] TCP соединение установлено с ${this.host}:${this.port}`);
 
-              // Отправляем WebSocket handshake
-              const handshake = [
-                'GET / HTTP/1.1',
-                `Host: ${this.host}:${this.port}`,
-                'Upgrade: websocket',
-                'Connection: Upgrade',
-                `Sec-WebSocket-Key: ${this.webSocketKey}`,
-                'Sec-WebSocket-Version: 13',
-                '',
-                '',
-              ].join('\r\n');
+                // Отправляем WebSocket handshake
+                const handshake = [
+                  'GET / HTTP/1.1',
+                  `Host: ${this.host}:${this.port}`,
+                  'Upgrade: websocket',
+                  'Connection: Upgrade',
+                  `Sec-WebSocket-Key: ${this.webSocketKey}`,
+                  'Sec-WebSocket-Version: 13',
+                  '',
+                  '',
+                ].join('\r\n');
 
-              this.socket.write(handshake);
-              console.log('[WebSocket Client] Handshake отправлен');
+                if (this.socket && !this.socket.destroyed) {
+                  this.socket.write(handshake);
+                  console.log('[WebSocket Client] Handshake отправлен');
+                } else {
+                  console.error('[WebSocket Client] Сокет уничтожен до отправки handshake');
+                  reject(new Error('Сокет уничтожен до отправки handshake'));
+                }
+              } catch (error) {
+                console.error('[WebSocket Client] Ошибка при отправке handshake:', error);
+                clearTimeout(connectionTimeout);
+                this.handleError(error);
+                reject(error);
+              }
             }
           );
 
+          // Убеждаемся, что обработчики устанавливаются только один раз
+          // Удаляем старые обработчики перед установкой новых (на случай повторного подключения)
+          this.socket.removeAllListeners('data');
+          this.socket.removeAllListeners('error');
+          this.socket.removeAllListeners('close');
+
           this.socket.on('data', (data) => {
-            this.handleData(data);
+            try {
+              this.handleData(data);
+            } catch (error) {
+              console.error('[WebSocket Client] Ошибка в обработчике data:', error);
+              this.handleError(error);
+            }
           });
 
           this.socket.on('error', (error) => {
-            clearTimeout(connectionTimeout);
-            const errorMessage = error.message || error.toString();
-            console.error('[WebSocket Client] Ошибка сокета:', errorMessage);
-            console.error('[WebSocket Client] Детали ошибки:', {
-              code: error.code,
-              errno: error.errno,
-              syscall: error.syscall,
-              address: error.address,
-              port: error.port,
-            });
-            this.handleError(error);
-            reject(error);
+            try {
+              clearTimeout(connectionTimeout);
+              const errorMessage = error.message || error.toString();
+              console.error('[WebSocket Client] Ошибка сокета:', errorMessage);
+              console.error('[WebSocket Client] Детали ошибки:', {
+                code: error.code,
+                errno: error.errno,
+                syscall: error.syscall,
+                address: error.address,
+                port: error.port,
+              });
+              this.handleError(error);
+              reject(error);
+            } catch (errorHandlerError) {
+              console.error('[WebSocket Client] Ошибка в обработчике error:', errorHandlerError);
+            }
           });
 
           this.socket.on('close', () => {
-            clearTimeout(connectionTimeout);
-            console.log('[WebSocket Client] Соединение закрыто');
-            this.handleClose();
+            try {
+              clearTimeout(connectionTimeout);
+              console.log('[WebSocket Client] Соединение закрыто');
+              this.handleClose();
+            } catch (error) {
+              console.error('[WebSocket Client] Ошибка в обработчике close:', error);
+            }
           });
 
           resolve();
@@ -456,80 +504,113 @@ class WebSocketClient {
    * @param {Buffer} data Данные
    */
   handleData(data) {
-    if (!this.isHandshakeComplete) {
-      // Обработка handshake ответа
-      this.buffer = Buffer.concat([this.buffer, data]);
-      const responseStr = this.buffer.toString();
+    try {
+      if (!this.isHandshakeComplete) {
+        // Обработка handshake ответа
+        try {
+          this.buffer = Buffer.concat([this.buffer, data]);
+          const responseStr = this.buffer.toString();
 
-      if (responseStr.includes('\r\n\r\n')) {
-        if (parseHandshakeResponse(responseStr, this.expectedAcceptKey)) {
-          this.isHandshakeComplete = true;
-          this.isConnected = true;
-          this.buffer = Buffer.alloc(0);
-          this.reconnectAttempts = 0;
-          this.lastPongTime = Date.now();
+          if (responseStr.includes('\r\n\r\n')) {
+            if (parseHandshakeResponse(responseStr, this.expectedAcceptKey)) {
+              this.isHandshakeComplete = true;
+              this.isConnected = true;
+              this.buffer = Buffer.alloc(0);
+              this.reconnectAttempts = 0;
+              this.lastPongTime = Date.now();
 
-          console.log('[WebSocket Client] Handshake завершен, соединение установлено');
+              console.log('[WebSocket Client] Handshake завершен, соединение установлено');
 
-          // Запускаем heartbeat
-          this.startHeartbeat();
+              // Запускаем heartbeat
+              this.startHeartbeat();
 
-          if (this.onOpenCallback) {
-            this.onOpenCallback();
-          }
-        } else {
-          console.error('[WebSocket Client] Неверный handshake ответ');
-          this.handleError(new Error('Неверный handshake ответ'));
-          this.disconnect();
-        }
-      }
-    } else {
-      // Обработка WebSocket frames
-      this.buffer = Buffer.concat([this.buffer, data]);
-
-      while (this.buffer.length > 0) {
-        const frame = parseWebSocketFrame(this.buffer);
-
-        if (!frame) {
-          // Неполный frame, ждем еще данных
-          break;
-        }
-
-        // Удаляем обработанные данные из буфера
-        const frameLength = 2 + (frame.payloadLength < 126 ? 0 : frame.payloadLength < 65536 ? 2 : 8) + (frame.masked ? 4 : 0) + frame.payloadLength;
-        this.buffer = this.buffer.slice(frameLength);
-
-        // Обработка frame
-        if (frame.opcode === 0x1) {
-          // Текстовое сообщение
-          const message = frame.payload.toString('utf8');
-          console.log('[WebSocket Client] Получено сообщение:', message);
-
-          if (this.onMessageCallback) {
-            try {
-              const parsed = JSON.parse(message);
-              this.onMessageCallback(parsed);
-            } catch (e) {
-              this.onMessageCallback(message);
+              if (this.onOpenCallback) {
+                try {
+                  this.onOpenCallback();
+                } catch (callbackError) {
+                  console.error('[WebSocket Client] Ошибка в onOpenCallback:', callbackError);
+                }
+              }
+            } else {
+              console.error('[WebSocket Client] Неверный handshake ответ');
+              this.handleError(new Error('Неверный handshake ответ'));
+              this.disconnect();
             }
           }
-        } else if (frame.opcode === 0x8) {
-          // Закрытие соединения
-          console.log('[WebSocket Client] Сервер запросил закрытие');
+        } catch (handshakeError) {
+          console.error('[WebSocket Client] Ошибка при обработке handshake:', handshakeError);
+          this.handleError(handshakeError);
           this.disconnect();
-        } else if (frame.opcode === 0x9) {
-          // Ping - отправляем Pong
-          this.sendPong();
-        } else if (frame.opcode === 0xa) {
-          // Pong
-          this.lastPongTime = Date.now();
-          if (this.heartbeatTimeout) {
-            clearTimeout(this.heartbeatTimeout);
-            this.heartbeatTimeout = null;
+        }
+      } else {
+        // Обработка WebSocket frames
+        try {
+          this.buffer = Buffer.concat([this.buffer, data]);
+
+          while (this.buffer.length > 0) {
+            const frame = parseWebSocketFrame(this.buffer);
+
+            if (!frame) {
+              // Неполный frame, ждем еще данных
+              break;
+            }
+
+            // Удаляем обработанные данные из буфера
+            const frameLength = 2 + (frame.payloadLength < 126 ? 0 : frame.payloadLength < 65536 ? 2 : 8) + (frame.masked ? 4 : 0) + frame.payloadLength;
+            this.buffer = this.buffer.slice(frameLength);
+
+            // Обработка frame
+            if (frame.opcode === 0x1) {
+              // Текстовое сообщение
+              try {
+                const message = frame.payload.toString('utf8');
+                console.log('[WebSocket Client] Получено сообщение:', message);
+
+                if (this.onMessageCallback) {
+                  try {
+                    const parsed = JSON.parse(message);
+                    this.onMessageCallback(parsed);
+                  } catch (e) {
+                    this.onMessageCallback(message);
+                  }
+                }
+              } catch (messageError) {
+                console.error('[WebSocket Client] Ошибка при обработке сообщения:', messageError);
+                // Продолжаем работу, не отключаемся из-за ошибки обработки сообщения
+              }
+            } else if (frame.opcode === 0x8) {
+              // Закрытие соединения
+              console.log('[WebSocket Client] Сервер запросил закрытие');
+              this.disconnect();
+            } else if (frame.opcode === 0x9) {
+              // Ping - отправляем Pong
+              try {
+                this.sendPong();
+              } catch (pongError) {
+                console.error('[WebSocket Client] Ошибка при отправке Pong:', pongError);
+              }
+            } else if (frame.opcode === 0xa) {
+              // Pong
+              this.lastPongTime = Date.now();
+              if (this.heartbeatTimeout) {
+                clearTimeout(this.heartbeatTimeout);
+                this.heartbeatTimeout = null;
+              }
+              console.log('[WebSocket Client] Получен Pong');
+            }
           }
-          console.log('[WebSocket Client] Получен Pong');
+        } catch (frameError) {
+          console.error('[WebSocket Client] Ошибка при обработке WebSocket frame:', frameError);
+          // При ошибке обработки frame отключаемся для безопасности
+          this.handleError(frameError);
+          this.disconnect();
         }
       }
+    } catch (error) {
+      console.error('[WebSocket Client] Критическая ошибка в handleData:', error);
+      this.handleError(error);
+      // Не отключаемся автоматически при критической ошибке, чтобы дать возможность восстановиться
+      // this.disconnect();
     }
   }
 
@@ -670,6 +751,8 @@ class WebSocketClient {
    * Отключается от сервера
    */
   disconnect() {
+    console.log('[WebSocket Client] Начинаем отключение...');
+
     this.stopHeartbeat();
 
     if (this.reconnectTimer) {
@@ -677,25 +760,52 @@ class WebSocketClient {
       this.reconnectTimer = null;
     }
 
+    // Удаляем все обработчики событий перед закрытием сокета
     if (this.socket) {
       try {
-        // Отправляем Close frame
-        if (this.isHandshakeComplete) {
-          const frame = createWebSocketFrame('', 0x8); // Close opcode
-          this.socket.write(frame);
+        // Удаляем обработчики, чтобы избежать утечек памяти и конфликтов
+        this.socket.removeAllListeners('data');
+        this.socket.removeAllListeners('error');
+        this.socket.removeAllListeners('close');
+
+        // Отправляем Close frame только если handshake завершен
+        if (this.isHandshakeComplete && !this.socket.destroyed) {
+          try {
+            const frame = createWebSocketFrame('', 0x8); // Close opcode
+            this.socket.write(frame);
+          } catch (writeError) {
+            // Игнорируем ошибки записи при закрытии
+            console.log('[WebSocket Client] Не удалось отправить Close frame (сокет уже закрыт)');
+          }
         }
-        this.socket.destroy();
+
+        if (!this.socket.destroyed) {
+          this.socket.destroy();
+        }
       } catch (error) {
         console.error('[WebSocket Client] Ошибка при отключении:', error);
+      } finally {
+        this.socket = null;
       }
-      this.socket = null;
     }
 
+    // Полная очистка состояния
     this.isConnected = false;
     this.isHandshakeComplete = false;
     this.buffer = Buffer.alloc(0);
     this.reconnectAttempts = 0;
     this.lastPongTime = null;
+    this.webSocketKey = null;
+    this.expectedAcceptKey = null;
+
+    // Очищаем колбэки, чтобы избежать утечек памяти
+    // Но не удаляем их полностью, так как они могут быть нужны для переподключения
+    // this.onOpenCallback = null;
+    // this.onMessageCallback = null;
+    // this.onErrorCallback = null;
+    // this.onCloseCallback = null;
+
+    console.log('[WebSocket Client] Отключение завершено');
   }
 
   /**
