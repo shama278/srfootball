@@ -50,26 +50,80 @@ const Scoreboard = () => {
     return () => subscription?.remove();
   }, []);
 
-  // Сбрасываем флаги ошибок при изменении логотипов команд
+  // Функция проверки временных файлов
+  const isTemporaryLogo = (logo) => {
+    if (!logo || typeof logo !== 'string') {
+      return false;
+    }
+    // Base64 логотипы (data:image/...) не являются временными
+    if (logo.startsWith('data:image/')) {
+      return false;
+    }
+    // Проверяем, содержит ли путь указания на временные файлы
+    return logo.includes('temp') || logo.includes('cache') || logo.includes('rn_image_picker_lib_temp');
+  };
+
+  // Используем ref для отслеживания уже очищенных логотипов, чтобы не очищать повторно
+  const cleanedLogosRef = React.useRef(new Set());
+
+  // Проверяем и очищаем временные файлы при монтировании и изменении логотипов
   useEffect(() => {
-    setTeam1LogoError(false);
-  }, [team1?.logo]);
+    const logoKey = `team1_${team1?.logo || 'null'}`;
+    // Очищаем только если это временный файл и мы еще не очищали этот конкретный путь
+    if (team1?.logo && isTemporaryLogo(team1.logo) && !cleanedLogosRef.current.has(logoKey)) {
+      cleanedLogosRef.current.add(logoKey);
+      // Очищаем асинхронно, чтобы не блокировать рендеринг
+      setTimeout(() => {
+        try {
+          if (context && context.updateTeam1Logo) {
+            context.updateTeam1Logo(null);
+          }
+        } catch (error) {
+          console.error('[Scoreboard] Ошибка при очистке логотипа команды 1:', error);
+        }
+      }, 0);
+    }
+    // Сбрасываем флаг ошибки, если логотип изменился на валидный
+    if (!team1?.logo || !isTemporaryLogo(team1.logo)) {
+      setTeam1LogoError(false);
+    }
+  }, [team1?.logo, context]);
 
   useEffect(() => {
-    setTeam2LogoError(false);
-  }, [team2?.logo]);
+    const logoKey = `team2_${team2?.logo || 'null'}`;
+    // Очищаем только если это временный файл и мы еще не очищали этот конкретный путь
+    if (team2?.logo && isTemporaryLogo(team2.logo) && !cleanedLogosRef.current.has(logoKey)) {
+      cleanedLogosRef.current.add(logoKey);
+      // Очищаем асинхронно, чтобы не блокировать рендеринг
+      setTimeout(() => {
+        try {
+          if (context && context.updateTeam2Logo) {
+            context.updateTeam2Logo(null);
+          }
+        } catch (error) {
+          console.error('[Scoreboard] Ошибка при очистке логотипа команды 2:', error);
+        }
+      }, 0);
+    }
+    // Сбрасываем флаг ошибки, если логотип изменился на валидный
+    if (!team2?.logo || !isTemporaryLogo(team2.logo)) {
+      setTeam2LogoError(false);
+    }
+  }, [team2?.logo, context]);
 
   // Защита от undefined значений с полной проверкой
   const safePeriod = (typeof period === 'number' && period >= 1) ? period : 1;
   const safeTeam1 = {
     name: (team1 && typeof team1.name === 'string') ? team1.name : 'Команда 1',
     score: (team1 && typeof team1.score === 'number') ? team1.score : 0,
-    logo: (team1 && team1.logo) ? team1.logo : null,
+    // Очищаем временные файлы сразу при рендеринге
+    logo: (team1 && team1.logo && !isTemporaryLogo(team1.logo)) ? team1.logo : null,
   };
   const safeTeam2 = {
     name: (team2 && typeof team2.name === 'string') ? team2.name : 'Команда 2',
     score: (team2 && typeof team2.score === 'number') ? team2.score : 0,
-    logo: (team2 && team2.logo) ? team2.logo : null,
+    // Очищаем временные файлы сразу при рендеринге
+    logo: (team2 && team2.logo && !isTemporaryLogo(team2.logo)) ? team2.logo : null,
   };
   const safeTimer = {
     minutes: (timer && typeof timer.minutes === 'number') ? Math.max(0, Math.min(99, timer.minutes)) : 0,
@@ -119,13 +173,34 @@ const Scoreboard = () => {
               <Image
                 source={
                   safeTeam1.logo && typeof safeTeam1.logo === 'string' && safeTeam1.logo.trim().length > 0 && !team1LogoError
-                    ? {uri: safeTeam1.logo}
+                    ? (safeTeam1.logo.startsWith('data:image/')
+                        ? {uri: safeTeam1.logo}
+                        : {uri: safeTeam1.logo})
                     : DEFAULT_LOGO
                 }
                 style={dynamicStyles.teamLogo}
                 resizeMode="contain"
                 onError={(error) => {
-                  console.error('[Scoreboard] Ошибка загрузки логотипа команды 1:', error);
+                  // Извлекаем только важную информацию об ошибке
+                  const errorMessage = error?.nativeEvent?.error || error?.message || 'Неизвестная ошибка';
+                  console.error('[Scoreboard] Ошибка загрузки логотипа команды 1:', errorMessage);
+
+                  // Если файл не найден (ENOENT) или это временный файл, очищаем логотип из состояния
+                  if (errorMessage.includes('ENOENT') || errorMessage.includes('No such file') || errorMessage.includes('temp') || isTemporaryLogo(team1?.logo)) {
+                    console.warn('[Scoreboard] Файл логотипа команды 1 не найден или временный, очищаем логотип');
+                    // Очищаем логотип через контекст асинхронно, чтобы не блокировать рендеринг
+                    setTimeout(() => {
+                      try {
+                        if (context && context.updateTeam1Logo) {
+                          context.updateTeam1Logo(null);
+                          console.log('[Scoreboard] Логотип команды 1 успешно очищен');
+                        }
+                      } catch (updateError) {
+                        console.error('[Scoreboard] Ошибка при очистке логотипа команды 1:', updateError);
+                      }
+                    }, 0);
+                  }
+
                   setTeam1LogoError(true);
                 }}
                 onLoadStart={() => {
@@ -162,13 +237,34 @@ const Scoreboard = () => {
               <Image
                 source={
                   safeTeam2.logo && typeof safeTeam2.logo === 'string' && safeTeam2.logo.trim().length > 0 && !team2LogoError
-                    ? {uri: safeTeam2.logo}
+                    ? (safeTeam2.logo.startsWith('data:image/')
+                        ? {uri: safeTeam2.logo}
+                        : {uri: safeTeam2.logo})
                     : DEFAULT_LOGO
                 }
                 style={dynamicStyles.teamLogo}
                 resizeMode="contain"
                 onError={(error) => {
-                  console.error('[Scoreboard] Ошибка загрузки логотипа команды 2:', error);
+                  // Извлекаем только важную информацию об ошибке
+                  const errorMessage = error?.nativeEvent?.error || error?.message || 'Неизвестная ошибка';
+                  console.error('[Scoreboard] Ошибка загрузки логотипа команды 2:', errorMessage);
+
+                  // Если файл не найден (ENOENT) или это временный файл, очищаем логотип из состояния
+                  if (errorMessage.includes('ENOENT') || errorMessage.includes('No such file') || errorMessage.includes('temp') || isTemporaryLogo(team2?.logo)) {
+                    console.warn('[Scoreboard] Файл логотипа команды 2 не найден или временный, очищаем логотип');
+                    // Очищаем логотип через контекст асинхронно, чтобы не блокировать рендеринг
+                    setTimeout(() => {
+                      try {
+                        if (context && context.updateTeam2Logo) {
+                          context.updateTeam2Logo(null);
+                          console.log('[Scoreboard] Логотип команды 2 успешно очищен');
+                        }
+                      } catch (updateError) {
+                        console.error('[Scoreboard] Ошибка при очистке логотипа команды 2:', updateError);
+                      }
+                    }, 0);
+                  }
+
                   setTeam2LogoError(true);
                 }}
                 onLoadStart={() => {

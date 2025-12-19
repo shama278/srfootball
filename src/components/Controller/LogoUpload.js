@@ -28,21 +28,86 @@ const LogoUpload = ({teamLabel, currentLogo, onLogoSelected, style}) => {
     );
   };
 
+  // Конвертирует изображение в base64 для передачи через WebSocket
+  const convertImageToBase64 = async (uri) => {
+    try {
+      // Используем fetch для чтения файла
+      const response = await fetch(uri);
+      const blob = await response.blob();
+
+      // Конвертируем blob в base64 используя встроенный API React Native
+      return new Promise((resolve, reject) => {
+        // В React Native используем встроенный способ конвертации
+        if (typeof global !== 'undefined' && global.FileReader) {
+          const reader = new global.FileReader();
+          reader.onloadend = () => {
+            const base64data = reader.result;
+            // Убираем префикс data:image/...;base64, если есть
+            const base64 = base64data.includes(',') ? base64data.split(',')[1] : base64data;
+            resolve(base64);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        } else {
+          // Альтернативный способ через ArrayBuffer
+          blob.arrayBuffer().then((buffer) => {
+            // Конвертируем ArrayBuffer в base64
+            const bytes = new Uint8Array(buffer);
+            const base64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+            let result = '';
+            for (let i = 0; i < bytes.length; i += 3) {
+              const b1 = bytes[i];
+              const b2 = bytes[i + 1] || 0;
+              const b3 = bytes[i + 2] || 0;
+              const bitmap = (b1 << 16) | (b2 << 8) | b3;
+              result += base64chars.charAt((bitmap >> 18) & 63);
+              result += base64chars.charAt((bitmap >> 12) & 63);
+              result += i + 1 < bytes.length ? base64chars.charAt((bitmap >> 6) & 63) : '=';
+              result += i + 2 < bytes.length ? base64chars.charAt(bitmap & 63) : '=';
+            }
+            resolve(result);
+          }).catch(reject);
+        }
+      });
+    } catch (error) {
+      console.error('[LogoUpload] Ошибка при конвертации изображения в base64:', error);
+      // В случае ошибки возвращаем null, чтобы использовать логотип по умолчанию
+      return null;
+    }
+  };
+
   const selectFromGallery = () => {
     const options = {
       mediaType: 'photo',
       quality: 0.8,
       maxWidth: 500,
       maxHeight: 500,
+      includeBase64: true, // Включаем base64 в ответ
     };
 
-    launchImageLibrary(options, (response) => {
+    launchImageLibrary(options, async (response) => {
       if (response.didCancel) {
       } else if (response.errorCode) {
         Alert.alert('Ошибка', 'Не удалось загрузить изображение');
       } else if (response.assets && response.assets[0]) {
-        const uri = response.assets[0].uri;
-        onLogoSelected(uri);
+        const asset = response.assets[0];
+        // Используем base64 если доступен, иначе конвертируем URI
+        if (asset.base64) {
+          // Формируем data URI для локального отображения и base64 для передачи
+          const dataUri = `data:${asset.type || 'image/jpeg'};base64,${asset.base64}`;
+          onLogoSelected(dataUri);
+        } else if (asset.uri) {
+          // Если base64 недоступен, конвертируем URI в base64
+          try {
+            const base64 = await convertImageToBase64(asset.uri);
+            const dataUri = `data:${asset.type || 'image/jpeg'};base64,${base64}`;
+            onLogoSelected(dataUri);
+          } catch (error) {
+            console.error('[LogoUpload] Ошибка при конвертации:', error);
+            // В случае ошибки используем оригинальный URI
+            onLogoSelected(asset.uri);
+          }
+        }
       }
     });
   };
@@ -53,15 +118,32 @@ const LogoUpload = ({teamLabel, currentLogo, onLogoSelected, style}) => {
       quality: 0.8,
       maxWidth: 500,
       maxHeight: 500,
+      includeBase64: true, // Включаем base64 в ответ
     };
 
-    launchCamera(options, (response) => {
+    launchCamera(options, async (response) => {
       if (response.didCancel) {
       } else if (response.errorCode) {
         Alert.alert('Ошибка', 'Не удалось сделать фото');
       } else if (response.assets && response.assets[0]) {
-        const uri = response.assets[0].uri;
-        onLogoSelected(uri);
+        const asset = response.assets[0];
+        // Используем base64 если доступен, иначе конвертируем URI
+        if (asset.base64) {
+          // Формируем data URI для локального отображения и base64 для передачи
+          const dataUri = `data:${asset.type || 'image/jpeg'};base64,${asset.base64}`;
+          onLogoSelected(dataUri);
+        } else if (asset.uri) {
+          // Если base64 недоступен, конвертируем URI в base64
+          try {
+            const base64 = await convertImageToBase64(asset.uri);
+            const dataUri = `data:${asset.type || 'image/jpeg'};base64,${base64}`;
+            onLogoSelected(dataUri);
+          } catch (error) {
+            console.error('[LogoUpload] Ошибка при конвертации:', error);
+            // В случае ошибки используем оригинальный URI
+            onLogoSelected(asset.uri);
+          }
+        }
       }
     });
   };

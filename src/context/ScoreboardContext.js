@@ -158,10 +158,58 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
       const savedState = await AsyncStorage.getItem('scoreboardState');
       if (savedState) {
         const parsed = JSON.parse(savedState);
-        setState((prev) => ({...prev, ...parsed}));
-        return parsed;
+
+        // Проверяем, не являются ли пути к логотипам временными файлами
+        const isTemporaryLogo = (logo) => {
+          if (!logo || typeof logo !== 'string') {
+            return false;
+          }
+          // Base64 логотипы (data:image/...) не являются временными
+          if (logo.startsWith('data:image/')) {
+            return false;
+          }
+          // Проверяем, содержит ли путь указания на временные файлы
+          return logo.includes('temp') || logo.includes('cache') || logo.includes('rn_image_picker_lib_temp');
+        };
+
+        // Убеждаемся, что загружаем все поля с проверкой и значениями по умолчанию
+        const loadedState = {
+          team1: {
+            name: parsed?.team1?.name || initialState.team1.name,
+            score: typeof parsed?.team1?.score === 'number' ? parsed.team1.score : initialState.team1.score,
+            // Загружаем base64 логотипы и валидные URI, но не временные файлы
+            logo: (parsed?.team1?.logo && !isTemporaryLogo(parsed.team1.logo)) ? parsed.team1.logo : initialState.team1.logo,
+          },
+          team2: {
+            name: parsed?.team2?.name || initialState.team2.name,
+            score: typeof parsed?.team2?.score === 'number' ? parsed.team2.score : initialState.team2.score,
+            // Загружаем base64 логотипы и валидные URI, но не временные файлы
+            logo: (parsed?.team2?.logo && !isTemporaryLogo(parsed.team2.logo)) ? parsed.team2.logo : initialState.team2.logo,
+          },
+          timer: {
+            minutes: typeof parsed?.timer?.minutes === 'number' ? parsed.timer.minutes : initialState.timer.minutes,
+            seconds: typeof parsed?.timer?.seconds === 'number' ? parsed.timer.seconds : initialState.timer.seconds,
+            isRunning: typeof parsed?.timer?.isRunning === 'boolean' ? parsed.timer.isRunning : initialState.timer.isRunning,
+            direction: parsed?.timer?.direction || initialState.timer.direction,
+            // Важно: загружаем targetMinutes и targetSeconds для корректной работы отсчета вверх
+            targetMinutes: typeof parsed?.timer?.targetMinutes === 'number' ? parsed.timer.targetMinutes : (parsed?.timer?.targetMinutes === undefined ? initialState.timer.targetMinutes : 0),
+            targetSeconds: typeof parsed?.timer?.targetSeconds === 'number' ? parsed.timer.targetSeconds : (parsed?.timer?.targetSeconds === undefined ? initialState.timer.targetSeconds : 0),
+          },
+          period: typeof parsed?.period === 'number' ? parsed.period : initialState.period,
+          settings: {
+            primaryColor: parsed?.settings?.primaryColor || initialState.settings.primaryColor,
+            secondaryColor: parsed?.settings?.secondaryColor || initialState.settings.secondaryColor,
+            accentColor: parsed?.settings?.accentColor || initialState.settings.accentColor,
+            fontSize: typeof parsed?.settings?.fontSize === 'number' ? parsed.settings.fontSize : initialState.settings.fontSize,
+            showLogos: typeof parsed?.settings?.showLogos === 'boolean' ? parsed.settings.showLogos : initialState.settings.showLogos,
+          },
+        };
+
+        setState(loadedState);
+        return loadedState;
       }
     } catch (error) {
+      console.error('[ScoreboardContext] Ошибка при загрузке состояния:', error);
     }
     return null;
   }, []);
@@ -171,8 +219,55 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
    */
   const saveState = useCallback(async (newState) => {
     try {
-      await AsyncStorage.setItem('scoreboardState', JSON.stringify(newState));
+      // Проверяем, не являются ли пути к логотипам временными файлами
+      const isTemporaryLogo = (logo) => {
+        if (!logo || typeof logo !== 'string') {
+          return false;
+        }
+        // Проверяем, содержит ли путь указания на временные файлы
+        // Base64 логотипы (data:image/...) не являются временными
+        if (logo.startsWith('data:image/')) {
+          return false;
+        }
+        return logo.includes('temp') || logo.includes('cache') || logo.includes('rn_image_picker_lib_temp');
+      };
+
+      // Убеждаемся, что сохраняем полное состояние со всеми полями
+      const stateToSave = {
+        team1: {
+          name: newState?.team1?.name || initialState.team1.name,
+          score: typeof newState?.team1?.score === 'number' ? newState.team1.score : initialState.team1.score,
+          // Сохраняем base64 логотипы и валидные URI, но не временные файлы
+          logo: (newState?.team1?.logo && !isTemporaryLogo(newState.team1.logo)) ? newState.team1.logo : initialState.team1.logo,
+        },
+        team2: {
+          name: newState?.team2?.name || initialState.team2.name,
+          score: typeof newState?.team2?.score === 'number' ? newState.team2.score : initialState.team2.score,
+          // Сохраняем base64 логотипы и валидные URI, но не временные файлы
+          logo: (newState?.team2?.logo && !isTemporaryLogo(newState.team2.logo)) ? newState.team2.logo : initialState.team2.logo,
+        },
+        timer: {
+          minutes: typeof newState?.timer?.minutes === 'number' ? newState.timer.minutes : initialState.timer.minutes,
+          seconds: typeof newState?.timer?.seconds === 'number' ? newState.timer.seconds : initialState.timer.seconds,
+          isRunning: typeof newState?.timer?.isRunning === 'boolean' ? newState.timer.isRunning : initialState.timer.isRunning,
+          direction: newState?.timer?.direction || initialState.timer.direction,
+          targetMinutes: typeof newState?.timer?.targetMinutes === 'number' ? newState.timer.targetMinutes : (initialState.timer.targetMinutes || 0),
+          targetSeconds: typeof newState?.timer?.targetSeconds === 'number' ? newState.timer.targetSeconds : (initialState.timer.targetSeconds || 0),
+        },
+        period: typeof newState?.period === 'number' ? newState.period : initialState.period,
+        settings: {
+          primaryColor: newState?.settings?.primaryColor || initialState.settings.primaryColor,
+          secondaryColor: newState?.settings?.secondaryColor || initialState.settings.secondaryColor,
+          accentColor: newState?.settings?.accentColor || initialState.settings.accentColor,
+          fontSize: typeof newState?.settings?.fontSize === 'number' ? newState.settings.fontSize : initialState.settings.fontSize,
+          showLogos: typeof newState?.settings?.showLogos === 'boolean' ? newState.settings.showLogos : initialState.settings.showLogos,
+        },
+      };
+
+      await AsyncStorage.setItem('scoreboardState', JSON.stringify(stateToSave));
     } catch (error) {
+      console.error('[ScoreboardContext] Ошибка при сохранении состояния:', error);
+      // Не пробрасываем ошибку, чтобы не крашить приложение
     }
   }, []);
 
@@ -799,13 +894,23 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
                 seconds = 59;
               } else {
                 // Таймер достиг нуля
-                return {
+                const stoppedState = {
                   ...prev,
                   timer: {
                     ...prev.timer,
                     isRunning: false,
                   },
                 };
+                // Сохраняем состояние при остановке таймера
+                if (isController) {
+                  try {
+                    saveState(stoppedState);
+                    broadcastUpdate({timer: stoppedState.timer});
+                  } catch (saveError) {
+                    console.error('[ScoreboardContext] Ошибка при сохранении состояния при остановке таймера:', saveError);
+                  }
+                }
+                return stoppedState;
               }
             } else {
               // Отсчет вверх - от 0:00 до указанного времени
@@ -821,7 +926,7 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
               // Проверяем, достигли ли целевого времени
               if (minutes > targetMinutes || (minutes === targetMinutes && seconds > targetSeconds)) {
                 // Достигли или превысили целевое время - останавливаем
-                return {
+                const stoppedState = {
                   ...prev,
                   timer: {
                     ...prev.timer,
@@ -830,6 +935,16 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
                     isRunning: false,
                   },
                 };
+                // Сохраняем состояние при остановке таймера
+                if (isController) {
+                  try {
+                    saveState(stoppedState);
+                    broadcastUpdate({timer: stoppedState.timer});
+                  } catch (saveError) {
+                    console.error('[ScoreboardContext] Ошибка при сохранении состояния при остановке таймера:', saveError);
+                  }
+                }
+                return stoppedState;
               }
             }
 
@@ -843,26 +958,32 @@ export const ScoreboardProvider = ({children, websocketClient = null, websocketS
 
             const newState = {...prev, ...updates};
 
+            // Сохраняем состояние каждую секунду при работе таймера
+            // Но не слишком часто, чтобы не перегружать AsyncStorage
+            // Сохраняем каждую секунду, так как это важно для восстановления состояния
             if (isController) {
               try {
                 saveState(newState);
                 broadcastUpdate(updates);
               } catch (saveError) {
+                console.error('[ScoreboardContext] Ошибка при сохранении состояния таймера:', saveError);
               }
             }
 
             return newState;
           } catch (error) {
+            console.error('[ScoreboardContext] Ошибка в автоматическом обновлении таймера:', error);
             return prev || initialState;
           }
         });
       } catch (error) {
         // Не останавливаем интервал, продолжаем работу
+        console.error('[ScoreboardContext] Ошибка в setInterval таймера:', error);
       }
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [state.timer.isRunning, state.timer.direction, isController]);
+  }, [state.timer.isRunning, state.timer.direction, isController, saveState, broadcastUpdate]);
 
   // Обертываем все методы в безопасные обертки
   const safeUpdateTeam1Score = useCallback((delta) => {
