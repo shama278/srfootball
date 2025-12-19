@@ -4,7 +4,7 @@ import {View, Text, TouchableOpacity, StyleSheet, ScrollView} from 'react-native
 /**
  * Компонент выбора периода
  */
-const PeriodSelector = ({currentPeriod, onSelectPeriod, style}) => {
+const PeriodSelector = ({currentPeriod = 1, onSelectPeriod, style}) => {
   const periods = [
     {id: 1, label: '1-й тайм'},
     {id: 2, label: '2-й тайм'},
@@ -41,15 +41,16 @@ const PeriodSelector = ({currentPeriod, onSelectPeriod, style}) => {
 
 const styles = StyleSheet.create({
   container: {
-    padding: 20,
+    padding: 15,
     backgroundColor: '#ffffff',
     borderRadius: 12,
-    marginVertical: 10,
     shadowColor: '#000',
     shadowOffset: {width: 0, height: 2},
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
+    flex: 1,
+    minHeight: 200,
   },
   label: {
     fontSize: 18,

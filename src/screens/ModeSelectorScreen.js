@@ -37,7 +37,6 @@ const ModeSelectorScreen = ({onModeSelected}) => {
       const recommended = await getRecommendedMode();
       setRecommendedMode(recommended);
     } catch (error) {
-      console.error('Ошибка при загрузке режима:', error);
     } finally {
       setLoading(false);
     }
@@ -48,7 +47,6 @@ const ModeSelectorScreen = ({onModeSelected}) => {
       await AsyncStorage.setItem(MODE_STORAGE_KEY, mode);
       onModeSelected(mode);
     } catch (error) {
-      console.error('Ошибка при сохранении режима:', error);
       // Продолжаем даже при ошибке сохранения
       onModeSelected(mode);
     }

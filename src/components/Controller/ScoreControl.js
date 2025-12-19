@@ -1,12 +1,20 @@
 import React from 'react';
-import {View, Text, TouchableOpacity, StyleSheet} from 'react-native';
+import {View, Text, TouchableOpacity, StyleSheet, Image} from 'react-native';
+
+// Логотип по умолчанию
+const DEFAULT_LOGO = require('../../../assets/default-logo.png');
 
 /**
  * Компонент управления счетом команды
  */
-const ScoreControl = ({teamName, score, onIncrement, onDecrement, style}) => {
+const ScoreControl = ({teamName, score, logo, onIncrement, onDecrement, style}) => {
   return (
     <View style={[styles.container, style]}>
+      <Image
+        source={logo ? {uri: logo} : DEFAULT_LOGO}
+        style={styles.logo}
+        resizeMode="contain"
+      />
       <Text style={styles.teamName}>{teamName}</Text>
       <View style={styles.scoreContainer}>
         <TouchableOpacity
@@ -29,21 +37,28 @@ const ScoreControl = ({teamName, score, onIncrement, onDecrement, style}) => {
 
 const styles = StyleSheet.create({
   container: {
-    padding: 20,
+    padding: 15,
     backgroundColor: '#ffffff',
     borderRadius: 12,
-    marginVertical: 10,
     shadowColor: '#000',
     shadowOffset: {width: 0, height: 2},
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
+    alignItems: 'center',
+  },
+  logo: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    marginBottom: 8,
+    backgroundColor: '#f0f0f0',
   },
   teamName: {
-    fontSize: 20,
+    fontSize: 16,
     fontWeight: '600',
     color: '#333',
-    marginBottom: 15,
+    marginBottom: 10,
     textAlign: 'center',
   },
   scoreContainer: {
@@ -75,10 +90,10 @@ const styles = StyleSheet.create({
     color: '#ffffff',
   },
   score: {
-    fontSize: 48,
+    fontSize: 42,
     fontWeight: 'bold',
     color: '#333',
-    minWidth: 80,
+    minWidth: 70,
     textAlign: 'center',
   },
 });

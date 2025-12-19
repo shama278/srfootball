@@ -16,31 +16,41 @@ import ErrorBoundary from './components/ErrorBoundary';
 if (typeof ErrorUtils !== 'undefined') {
   const originalGlobalHandler = ErrorUtils.getGlobalHandler();
   ErrorUtils.setGlobalHandler((error, isFatal) => {
-    console.error('[App] ГЛОБАЛЬНАЯ НЕОБРАБОТАННАЯ ОШИБКА:', error);
-    console.error('[App] Фатальная:', isFatal);
-    console.error('[App] Stack trace:', error.stack);
+    // Игнорируем ошибки, связанные с закрытыми сокетами - это нормально
+    const errorMessage = error?.message || error?.toString() || '';
+    if (errorMessage.includes('Socket is closed') || errorMessage.includes('setBroadcast')) {
+      // Это нормальная ошибка при закрытии сокетов, не логируем как критичную
+      return;
+    }
+
+    // Логируем только критичные ошибки
+    if (isFatal || error) {
+      console.error('[App] Глобальная ошибка:', error?.message || error);
+      if (error?.stack) {
+        console.error('[App] Stack:', error.stack);
+      }
+    }
 
     // Вызываем оригинальный обработчик, но не крашим приложение
     if (originalGlobalHandler) {
       try {
         originalGlobalHandler(error, isFatal);
       } catch (handlerError) {
-        console.error('[App] Ошибка в глобальном обработчике ошибок:', handlerError);
+        console.error('[App] Ошибка в обработчике:', handlerError);
       }
     }
-
-    // НЕ крашим приложение, продолжаем работу
-    // React Native по умолчанию крашит приложение при фатальных ошибках
-    // Мы перехватываем это и продолжаем работу
   });
 }
+
 
 // Обработка необработанных промисов
 if (typeof global !== 'undefined' && global.Promise) {
   const originalUnhandledRejection = global.onunhandledrejection;
   global.onunhandledrejection = (event) => {
-    console.error('[App] НЕОБРАБОТАННОЕ ОТКЛОНЕНИЕ ПРОМИСА:', event.reason);
-    console.error('[App] Stack trace:', event.reason?.stack);
+    // Логируем только критичные отклонения
+    if (event?.reason) {
+      console.error('[App] Необработанное отклонение промиса:', event.reason);
+    }
 
     // Предотвращаем краш приложения
     event.preventDefault();
@@ -49,40 +59,119 @@ if (typeof global !== 'undefined' && global.Promise) {
       try {
         originalUnhandledRejection(event);
       } catch (handlerError) {
-        console.error('[App] Ошибка в обработчике отклоненных промисов:', handlerError);
+        console.error('[App] Ошибка в обработчике:', handlerError);
       }
     }
   };
 }
 
+// Защита от hot reload - сохраняем состояние при перезагрузке
+let appStateRef = null;
+if (typeof global !== 'undefined') {
+  if (!global.__APP_STATE_REF__) {
+    global.__APP_STATE_REF__ = {
+      mode: null,
+      websocketServer: null,
+      websocketClient: null,
+      showConnectionSetup: false,
+      error: null,
+    };
+  }
+  appStateRef = global.__APP_STATE_REF__;
+}
+
 const App = () => {
-  const [mode, setMode] = useState(null);
-  const [websocketServer, setWebsocketServer] = useState(null);
-  const [websocketClient, setWebsocketClient] = useState(null);
-  const [showConnectionSetup, setShowConnectionSetup] = useState(false);
-  const [error, setError] = useState(null);
-  const [discoveryService] = useState(() => new DiscoveryService());
+  // Защита от ошибок инициализации при hot reload
+  let modeState, websocketServerState, websocketClientState, showConnectionSetupState, errorState;
+  let discoveryServiceInstance;
+
+  try {
+    // Используем ref для сохранения состояния при hot reload
+    modeState = appStateRef?.mode ?? null;
+    websocketServerState = appStateRef?.websocketServer ?? null;
+    websocketClientState = appStateRef?.websocketClient ?? null;
+    showConnectionSetupState = appStateRef?.showConnectionSetup ?? false;
+    errorState = appStateRef?.error ?? null;
+  } catch (error) {
+    console.error('[App] Ошибка при чтении сохраненного состояния:', error);
+    modeState = null;
+    websocketServerState = null;
+    websocketClientState = null;
+    showConnectionSetupState = false;
+    errorState = null;
+  }
+
+  const [mode, setMode] = useState(modeState);
+  const [websocketServer, setWebsocketServer] = useState(websocketServerState);
+  const [websocketClient, setWebsocketClient] = useState(websocketClientState);
+  const [showConnectionSetup, setShowConnectionSetup] = useState(showConnectionSetupState);
+  const [error, setError] = useState(errorState);
+
+  const [discoveryService] = useState(() => {
+    try {
+      // Пытаемся переиспользовать существующий сервис при hot reload
+      if (global.__DISCOVERY_SERVICE__) {
+        return global.__DISCOVERY_SERVICE__;
+      }
+      const service = new DiscoveryService();
+      global.__DISCOVERY_SERVICE__ = service;
+      return service;
+    } catch (error) {
+      console.error('[App] Ошибка создания DiscoveryService:', error);
+      try {
+        return new DiscoveryService();
+      } catch (fallbackError) {
+        console.error('[App] Критическая ошибка создания DiscoveryService:', fallbackError);
+        return null;
+      }
+    }
+  });
+
+  // Сохраняем состояние в глобальный ref при изменении (для hot reload)
+  useEffect(() => {
+    try {
+      if (appStateRef) {
+        appStateRef.mode = mode;
+        appStateRef.websocketServer = websocketServer;
+        appStateRef.websocketClient = websocketClient;
+        appStateRef.showConnectionSetup = showConnectionSetup;
+        appStateRef.error = error;
+      }
+    } catch (error) {
+      console.error('[App] Ошибка при сохранении состояния в ref:', error);
+    }
+  }, [mode, websocketServer, websocketClient, showConnectionSetup, error]);
+
 
   useEffect(() => {
     // Очистка при размонтировании
     return () => {
-      // Вызываем async функции без await, так как cleanup не может быть async
-      if (websocketServer) {
-        websocketServer.stop().catch((error) => {
-          console.error('[App] Ошибка при остановке сервера при размонтировании:', error);
-        });
-      }
-      if (websocketClient) {
-        try {
-          websocketClient.disconnect();
-        } catch (error) {
-          console.error('[App] Ошибка при отключении клиента при размонтировании:', error);
+      // НЕ очищаем ресурсы при hot reload, только при реальном размонтировании
+      // Проверяем, это hot reload или реальное размонтирование
+      const isHotReload = typeof global !== 'undefined' && global.__APP_STATE_REF__;
+
+      if (!isHotReload) {
+        // Только при реальном размонтировании очищаем ресурсы
+        // Вызываем async функции без await, так как cleanup не может быть async
+        if (websocketServer) {
+          websocketServer.stop().catch((error) => {
+            console.error('[App] Ошибка при остановке WebSocket сервера:', error);
+          });
         }
-      }
-      try {
-        discoveryService.stop();
-      } catch (error) {
-        console.error('[App] Ошибка при остановке discovery сервиса:', error);
+        if (websocketClient) {
+          try {
+            websocketClient.disconnect();
+          } catch (error) {
+            console.error('[App] Ошибка при отключении WebSocket клиента:', error);
+          }
+        }
+        if (discoveryService) {
+          try {
+            discoveryService.stop();
+          } catch (error) {
+            console.error('[App] Ошибка при остановке DiscoveryService:', error);
+          }
+        }
       }
     };
   }, [websocketServer, websocketClient, discoveryService]);
@@ -91,13 +180,11 @@ const App = () => {
     try {
       // Сначала останавливаем старый сервер, если он есть
       if (websocketServer) {
-        console.log('[App] Останавливаем старый WebSocket сервер перед запуском нового');
         try {
           await websocketServer.stop();
           // Даем время на полную остановку
           await new Promise(resolve => setTimeout(resolve, 500));
         } catch (stopError) {
-          console.error('[App] Ошибка при остановке старого сервера:', stopError);
         }
         setWebsocketServer(null);
       }
@@ -109,20 +196,15 @@ const App = () => {
             // Вызываем асинхронно, чтобы не блокировать поток и не вызывать ошибки во время рендеринга
             setTimeout(() => {
               try {
-                console.log(`[App] Контроллер подключен к табло: ${socketId}`);
                 try {
                   const count = server.getClientCount();
-                  console.log(`[App] Всего подключенных контроллеров: ${count}`);
                 } catch (countError) {
-                  console.error(`[App] Ошибка при получении количества клиентов:`, countError);
                 }
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике подключения для ${socketId}:`, error);
                 // Не пробрасываем ошибку дальше
               }
             }, 0);
           } catch (error) {
-            console.error(`[App] Критическая ошибка в обработчике подключения для ${socketId}:`, error);
             // Не пробрасываем ошибку дальше
           }
         },
@@ -131,15 +213,12 @@ const App = () => {
             // Вызываем асинхронно
             setTimeout(() => {
               try {
-                console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
                 // Сообщения обрабатываются в ScoreboardContext
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике сообщений для ${socketId}:`, error);
                 // Не пробрасываем ошибку дальше
               }
             }, 0);
           } catch (error) {
-            console.error(`[App] Критическая ошибка в обработчике сообщений для ${socketId}:`, error);
             // Не пробрасываем ошибку дальше
           }
         },
@@ -148,38 +227,28 @@ const App = () => {
             // Вызываем асинхронно
             setTimeout(() => {
               try {
-                console.log(`[App] Контроллер отключен от табло: ${socketId}`);
                 try {
                   const count = server.getClientCount();
-                  console.log(`[App] Всего подключенных контроллеров: ${count}`);
                 } catch (countError) {
-                  console.error(`[App] Ошибка при получении количества клиентов:`, countError);
                 }
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике отключения для ${socketId}:`, error);
                 // Не пробрасываем ошибку дальше
               }
             }, 0);
           } catch (error) {
-            console.error(`[App] Критическая ошибка в обработчике отключения для ${socketId}:`, error);
             // Не пробрасываем ошибку дальше
           }
         }
       );
-      console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
       setWebsocketServer(server);
 
       // Запускаем ответы на discovery запросы от контроллеров
-      if (ipAddress) {
-        console.log(`[App] ========================================`);
-        console.log(`[App] Запуск discovery сервиса для табло...`);
-        console.log(`[App] IP адрес табло: ${ipAddress}`);
-        console.log(`[App] Порт WebSocket: ${getDefaultWebSocketPort()}`);
-        console.log(`[App] ========================================`);
-        discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
-        console.log(`[App] Discovery ответы запущены для табло`);
-      } else {
-        console.error(`[App] ОШИБКА: IP адрес табло не определен! Discovery не запущен!`);
+      if (ipAddress && discoveryService) {
+        try {
+          discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
+        } catch (error) {
+          console.error('[App] Ошибка при запуске discovery ответов:', error);
+        }
       }
 
       // Дополнительная задержка, чтобы сервер точно был готов принимать подключения
@@ -187,12 +256,10 @@ const App = () => {
 
       return true;
     } catch (error) {
-      console.error('[App] Ошибка при запуске WebSocket сервера:', error);
       const errorMessage = error.message || error.toString();
 
       // Если порт занят, пытаемся остановить старый сервер и повторить попытку
       if (errorMessage.includes('EADDRINUSE') || errorMessage.includes('address already in use') || errorMessage.includes('port') && errorMessage.includes('already')) {
-        console.log('[App] Порт занят, пытаемся освободить его и повторить запуск');
         try {
           // Ждем немного и пытаемся снова
           await new Promise(resolve => setTimeout(resolve, 1000));
@@ -200,44 +267,30 @@ const App = () => {
           const ipAddress = await server.start(
             (socketId) => {
               try {
-                console.log(`[App] Контроллер подключен к табло: ${socketId}`);
-                console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике подключения для ${socketId}:`, error);
               }
             },
             (socketId, message) => {
               try {
-                console.log(`[App] Сообщение от контроллера ${socketId}:`, message);
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике сообщений для ${socketId}:`, error);
               }
             },
             (socketId) => {
               try {
-                console.log(`[App] Контроллер отключен от табло: ${socketId}`);
-                console.log(`[App] Всего подключенных контроллеров: ${server.getClientCount()}`);
               } catch (error) {
-                console.error(`[App] Ошибка в обработчике отключения для ${socketId}:`, error);
               }
             }
           );
-          console.log(`[App] WebSocket сервер запущен на ${ipAddress}:${getDefaultWebSocketPort()}`);
           setWebsocketServer(server);
-          if (ipAddress) {
-            console.log(`[App] ========================================`);
-            console.log(`[App] Запуск discovery сервиса для табло (повторная попытка)...`);
-            console.log(`[App] IP адрес табло: ${ipAddress}`);
-            console.log(`[App] Порт WebSocket: ${getDefaultWebSocketPort()}`);
-            console.log(`[App] ========================================`);
-            discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
-            console.log(`[App] Discovery ответы запущены для табло (повторная попытка)`);
-          } else {
-            console.error(`[App] ОШИБКА: IP адрес табло не определен! Discovery не запущен!`);
+          if (ipAddress && discoveryService) {
+            try {
+              discoveryService.startResponding(ipAddress, getDefaultWebSocketPort());
+            } catch (error) {
+              console.error('[App] Ошибка при запуске discovery ответов (retry):', error);
+            }
           }
           return true;
         } catch (retryError) {
-          console.error('[App] Ошибка при повторной попытке запуска сервера:', retryError);
         }
       }
 
@@ -262,7 +315,6 @@ const App = () => {
     } catch (error) {
       console.error('[App] Ошибка при выборе режима:', error);
       // Не устанавливаем ошибку, чтобы приложение не закрывалось
-      console.error('[App] Продолжаем работу несмотря на ошибку');
     }
   };
 
@@ -270,11 +322,9 @@ const App = () => {
     try {
       // Отключаем старый клиент перед созданием нового
       if (websocketClient) {
-        console.log('[App] Отключаем старый WebSocket клиент перед созданием нового');
         try {
           websocketClient.disconnect();
         } catch (disconnectError) {
-          console.error('[App] Ошибка при отключении старого клиента:', disconnectError);
         }
         // Даем время на полное закрытие соединения
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -283,25 +333,11 @@ const App = () => {
       const port = getDefaultWebSocketPort();
       // Получаем локальный IP адрес для принудительного использования IPv4
       const localIP = await getLocalIPAddress();
-      console.log(`[App] Получен локальный IP адрес: ${localIP || 'null'}`);
-
-      if (!localIP) {
-        console.warn(`[App] ВНИМАНИЕ: Не удалось получить локальный IP адрес! Подключение может использовать IPv6`);
-      }
 
       const client = new WebSocketClient(displayIP, port, localIP || null);
       setWebsocketClient(client);
       setShowConnectionSetup(false);
-
-      console.log(`[App] WebSocket клиент создан для подключения к табло ${displayIP}:${port}`);
-      if (localIP) {
-        console.log(`[App] Используется localAddress ${localIP} для принудительного IPv4`);
-      } else {
-        console.warn(`[App] localAddress не установлен - возможно использование IPv6!`);
-      }
-      console.log(`[App] Подключение будет выполнено в ScoreboardContext`);
     } catch (error) {
-      console.error('[App] Ошибка при создании WebSocket клиента:', error);
     }
   };
 
@@ -353,6 +389,20 @@ const App = () => {
   }
 
   try {
+    // Дополнительная защита от ошибок при hot reload
+    if (typeof mode === 'undefined' || (mode === null && showConnectionSetup)) {
+      // Не делаем setState в рендере, просто возвращаем безопасный UI
+      return (
+        <ErrorBoundary>
+          <SafeAreaView style={styles.container}>
+            <View style={styles.errorContainer}>
+              <Text style={styles.errorText}>Перезагрузка приложения...</Text>
+            </View>
+          </SafeAreaView>
+        </ErrorBoundary>
+      );
+    }
+
     return (
       <ErrorBoundary>
         <ScoreboardProvider
@@ -362,16 +412,64 @@ const App = () => {
           <SafeAreaView style={styles.container}>
             <StatusBar barStyle={isController ? 'dark-content' : 'light-content'} />
             {isController ? (
-              <ControllerScreen onModeChange={() => {
+              <ControllerScreen onModeChange={async () => {
                 try {
+                  // Явно отключаемся от WebSocket соединения перед переключением режима
+                  if (websocketClient) {
+                    try {
+                      // Отключаемся без автоматического переподключения
+                      websocketClient.disconnect();
+                      // Даем время на полное закрытие соединения
+                      await new Promise(resolve => setTimeout(resolve, 500));
+                    } catch (disconnectError) {
+                      console.error('[App] Ошибка при отключении WebSocket клиента:', disconnectError);
+                    }
+                    setWebsocketClient(null);
+                  }
+
+                  // Останавливаем discovery broadcast (только для контроллера, не влияет на табло)
+                  if (discoveryService && isController) {
+                    try {
+                      discoveryService.stopBroadcast();
+                    } catch (stopError) {
+                      console.error('[App] Ошибка при остановке discovery broadcast:', stopError);
+                    }
+                  }
+
+                  // Небольшая задержка перед переключением режима для полной очистки
+                  await new Promise(resolve => setTimeout(resolve, 200));
                   setMode(null);
                 } catch (error) {
                   console.error('[App] Ошибка при изменении режима:', error);
                 }
               }} />
             ) : (
-              <DisplayScreen onModeChange={() => {
+              <DisplayScreen onModeChange={async () => {
                 try {
+                  // Явно останавливаем WebSocket сервер перед переключением режима
+                  if (websocketServer) {
+                    try {
+                      // Останавливаем сервер и закрываем все соединения
+                      await websocketServer.stop();
+                      // Даем время на полную остановку сервера и закрытие всех соединений
+                      await new Promise(resolve => setTimeout(resolve, 800));
+                    } catch (stopError) {
+                      console.error('[App] Ошибка при остановке WebSocket сервера:', stopError);
+                    }
+                    setWebsocketServer(null);
+                  }
+
+                  // Останавливаем discovery ответы (только для табло, не влияет на контроллер)
+                  if (discoveryService && !isController) {
+                    try {
+                      discoveryService.stopResponding();
+                    } catch (stopError) {
+                      console.error('[App] Ошибка при остановке discovery ответов:', stopError);
+                    }
+                  }
+
+                  // Небольшая задержка перед переключением режима для полной очистки
+                  await new Promise(resolve => setTimeout(resolve, 200));
                   setMode(null);
                 } catch (error) {
                   console.error('[App] Ошибка при изменении режима:', error);
@@ -383,8 +481,7 @@ const App = () => {
       </ErrorBoundary>
     );
   } catch (error) {
-    console.error('[App] КРИТИЧЕСКАЯ ОШИБКА при рендеринге App:', error);
-    console.error('[App] Stack trace:', error.stack);
+    console.error('[App] Критическая ошибка в рендере:', error);
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.errorContainer}>
@@ -402,7 +499,6 @@ const App = () => {
                 setMode(null);
                 setError(null);
               } catch (resetError) {
-                console.error('[App] Ошибка при сбросе:', resetError);
               }
             }}>
             <Text style={styles.errorButtonText}>Перезапустить</Text>

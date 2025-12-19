@@ -16,13 +16,12 @@ class ErrorBoundary extends React.Component {
   }
 
   componentDidCatch(error, errorInfo) {
-    // Логируем ошибку
-    console.error('[ErrorBoundary] Перехвачена ошибка:', error);
-    console.error('[ErrorBoundary] Информация об ошибке:', errorInfo);
-    console.error('[ErrorBoundary] Stack trace:', error.stack);
-    if (errorInfo && errorInfo.componentStack) {
-      console.error('[ErrorBoundary] Component stack:', errorInfo.componentStack);
-    }
+    // Детальное логирование ошибки
+    console.error('[ErrorBoundary] Поймана ошибка:', error);
+    console.error('[ErrorBoundary] Сообщение:', error?.message);
+    console.error('[ErrorBoundary] Stack:', error?.stack);
+    console.error('[ErrorBoundary] Component Stack:', errorInfo?.componentStack);
+    console.error('[ErrorBoundary] Полная информация:', JSON.stringify(errorInfo, null, 2));
 
     this.setState({
       error: error,

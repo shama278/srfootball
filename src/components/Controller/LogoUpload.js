@@ -38,10 +38,8 @@ const LogoUpload = ({teamLabel, currentLogo, onLogoSelected, style}) => {
 
     launchImageLibrary(options, (response) => {
       if (response.didCancel) {
-        console.log('Пользователь отменил выбор изображения');
       } else if (response.errorCode) {
         Alert.alert('Ошибка', 'Не удалось загрузить изображение');
-        console.error('Ошибка ImagePicker:', response.errorMessage);
       } else if (response.assets && response.assets[0]) {
         const uri = response.assets[0].uri;
         onLogoSelected(uri);
@@ -59,10 +57,8 @@ const LogoUpload = ({teamLabel, currentLogo, onLogoSelected, style}) => {
 
     launchCamera(options, (response) => {
       if (response.didCancel) {
-        console.log('Пользователь отменил съемку');
       } else if (response.errorCode) {
         Alert.alert('Ошибка', 'Не удалось сделать фото');
-        console.error('Ошибка Camera:', response.errorMessage);
       } else if (response.assets && response.assets[0]) {
         const uri = response.assets[0].uri;
         onLogoSelected(uri);
@@ -123,10 +119,10 @@ const LogoUpload = ({teamLabel, currentLogo, onLogoSelected, style}) => {
 
 const styles = StyleSheet.create({
   container: {
-    padding: 20,
+    padding: 15,
     backgroundColor: '#ffffff',
     borderRadius: 12,
-    marginVertical: 10,
+    marginBottom: 10,
     shadowColor: '#000',
     shadowOffset: {width: 0, height: 2},
     shadowOpacity: 0.1,

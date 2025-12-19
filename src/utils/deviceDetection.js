@@ -21,7 +21,6 @@ export const isAndroidTV = async () => {
     // Пользователь может выбрать режим вручную через ModeSelectorScreen
     return false;
   } catch (error) {
-    console.error("Ошибка при определении типа устройства:", error);
     return false;
   }
 };
@@ -37,7 +36,6 @@ export const isTablet = async () => {
     const tv = await isAndroidTV();
     return !tv;
   } catch (error) {
-    console.error("Ошибка при определении типа устройства:", error);
     return false;
   }
 };
@@ -54,7 +52,6 @@ export const getRecommendedMode = async () => {
     }
     return "controller";
   } catch (error) {
-    console.error("Ошибка при определении режима работы:", error);
     return null;
   }
 };

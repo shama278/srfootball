@@ -1,7 +1,6 @@
 import React, {useState, useEffect} from 'react';
 import {
   View,
-  ScrollView,
   StyleSheet,
   SafeAreaView,
   Text,
@@ -12,11 +11,9 @@ import {useScoreboard} from '../context/ScoreboardContext';
 import ScoreControl from '../components/Controller/ScoreControl';
 import TimerControl from '../components/Controller/TimerControl';
 import PeriodSelector from '../components/Controller/PeriodSelector';
-import TeamEditor from '../components/Controller/TeamEditor';
-import LogoUpload from '../components/Controller/LogoUpload';
-import SettingsPanel from '../components/Controller/SettingsPanel';
 import ConnectionStatus from '../components/Common/ConnectionStatus';
-import {getLocalIPAddress, getDefaultWebSocketPort} from '../services/networkUtils';
+import SettingsScreen from './SettingsScreen';
+import {getLocalIPAddress} from '../services/networkUtils';
 import logger from '../services/logger';
 
 /**
@@ -27,10 +24,6 @@ const ControllerScreen = ({onShowLogs, onModeChange}) => {
     state,
     updateTeam1Score,
     updateTeam2Score,
-    updateTeam1Name,
-    updateTeam2Name,
-    updateTeam1Logo,
-    updateTeam2Logo,
     startTimer,
     stopTimer,
     resetTimer,
@@ -42,6 +35,7 @@ const ControllerScreen = ({onShowLogs, onModeChange}) => {
   const {team1, team2, timer, period} = state;
   const [ipAddress, setIpAddress] = useState('');
   const [showIpInfo, setShowIpInfo] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     loadIpAddress();
@@ -75,12 +69,18 @@ const ControllerScreen = ({onShowLogs, onModeChange}) => {
               <Text style={styles.ipButtonText}>IP</Text>
             </TouchableOpacity>
           )}
+          <TouchableOpacity
+            style={styles.settingsButton}
+            onPress={() => setShowSettings(true)}
+            activeOpacity={0.7}>
+            <Text style={styles.settingsButtonText}>⚙️</Text>
+          </TouchableOpacity>
           {onModeChange && (
             <TouchableOpacity
               style={styles.modeButton}
               onPress={onModeChange}
               activeOpacity={0.7}>
-              <Text style={styles.modeButtonText}>⚙️</Text>
+              <Text style={styles.modeButtonText}>🔄</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -97,65 +97,53 @@ const ControllerScreen = ({onShowLogs, onModeChange}) => {
         </View>
       )}
 
-      <ScrollView style={styles.scrollView} contentContainerStyle={styles.content}>
-        {/* Управление счетом */}
-        <View style={styles.section}>
-          <ScoreControl
-            teamName={team1.name}
-            score={team1.score}
-            onIncrement={() => updateTeam1Score(1)}
-            onDecrement={() => updateTeam1Score(-1)}
-          />
-          <ScoreControl
-            teamName={team2.name}
-            score={team2.score}
-            onIncrement={() => updateTeam2Score(1)}
-            onDecrement={() => updateTeam2Score(-1)}
-          />
+      <View style={styles.content}>
+        {/* Управление счетом - компактно в ряд */}
+        <View style={styles.scoreRow}>
+          <View style={styles.scoreColumn}>
+            <ScoreControl
+              teamName={team1.name}
+              score={team1.score}
+              logo={team1.logo}
+              onIncrement={() => updateTeam1Score(1)}
+              onDecrement={() => updateTeam1Score(-1)}
+            />
+          </View>
+          <View style={styles.scoreColumn}>
+            <ScoreControl
+              teamName={team2.name}
+              score={team2.score}
+              logo={team2.logo}
+              onIncrement={() => updateTeam2Score(1)}
+              onDecrement={() => updateTeam2Score(-1)}
+            />
+          </View>
         </View>
 
-        {/* Управление таймером */}
-        <TimerControl
-          minutes={timer.minutes}
-          seconds={timer.seconds}
-          isRunning={timer.isRunning}
-          onStart={startTimer}
-          onStop={stopTimer}
-          onReset={resetTimer}
-          onSetTime={setTimer}
-        />
+        {/* Управление таймером и периодом - рядом */}
+        <View style={styles.timerPeriodRow}>
+          <View style={styles.timerColumn}>
+            <TimerControl
+              minutes={timer?.minutes || 0}
+              seconds={timer?.seconds || 0}
+              isRunning={timer?.isRunning || false}
+              onStart={startTimer}
+              onStop={stopTimer}
+              onReset={resetTimer}
+            />
+          </View>
+          <View style={styles.periodColumn}>
+            <PeriodSelector currentPeriod={period || 1} onSelectPeriod={updatePeriod} />
+          </View>
+        </View>
+      </View>
 
-        {/* Выбор периода */}
-        <PeriodSelector currentPeriod={period} onSelectPeriod={updatePeriod} />
-
-        {/* Редактирование команд */}
-        <TeamEditor
-          teamLabel="Команда 1"
-          teamName={team1.name}
-          logo={team1.logo}
-          onNameChange={updateTeam1Name}
-        />
-        <LogoUpload
-          teamLabel="Команда 1"
-          currentLogo={team1.logo}
-          onLogoSelected={updateTeam1Logo}
-        />
-
-        <TeamEditor
-          teamLabel="Команда 2"
-          teamName={team2.name}
-          logo={team2.logo}
-          onNameChange={updateTeam2Name}
-        />
-        <LogoUpload
-          teamLabel="Команда 2"
-          currentLogo={team2.logo}
-          onLogoSelected={updateTeam2Logo}
-        />
-
-        {/* Настройки */}
-        <SettingsPanel onShowLogs={onShowLogs} />
-      </ScrollView>
+      {/* Экран настроек */}
+      <SettingsScreen
+        visible={showSettings}
+        onClose={() => setShowSettings(false)}
+        onShowLogs={onShowLogs}
+      />
     </SafeAreaView>
   );
 };
@@ -233,14 +221,39 @@ const styles = StyleSheet.create({
     color: '#666',
     fontStyle: 'italic',
   },
-  scrollView: {
-    flex: 1,
-  },
   content: {
+    flex: 1,
     padding: 15,
   },
-  section: {
+  scoreRow: {
+    flexDirection: 'row',
     marginBottom: 10,
+  },
+  scoreColumn: {
+    flex: 1,
+    marginHorizontal: 5,
+  },
+  timerPeriodRow: {
+    flexDirection: 'row',
+    marginBottom: 10,
+  },
+  timerColumn: {
+    flex: 1,
+    marginRight: 5,
+  },
+  periodColumn: {
+    flex: 1,
+    marginLeft: 5,
+  },
+  settingsButton: {
+    backgroundColor: '#2196f3',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  settingsButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
   },
 });
 

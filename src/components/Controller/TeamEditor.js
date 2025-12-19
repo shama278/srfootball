@@ -75,10 +75,10 @@ const TeamEditor = ({teamLabel, teamName, logo, onNameChange, onLogoSelect, styl
 
 const styles = StyleSheet.create({
   container: {
-    padding: 20,
+    padding: 15,
     backgroundColor: '#ffffff',
     borderRadius: 12,
-    marginVertical: 10,
+    marginBottom: 10,
     shadowColor: '#000',
     shadowOffset: {width: 0, height: 2},
     shadowOpacity: 0.1,

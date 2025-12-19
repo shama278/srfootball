@@ -68,7 +68,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         setIpAddress(saved);
       }
     } catch (error) {
-      console.error('Ошибка при загрузке сохраненного IP:', error);
     }
   };
 
@@ -77,7 +76,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       await AsyncStorage.setItem(CONTROLLER_IP_KEY, ip);
       setSavedIp(ip);
     } catch (error) {
-      console.error('Ошибка при сохранении IP:', error);
     }
   }, []);
 
@@ -101,14 +99,8 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
       try {
         // Получаем локальный IP адрес для принудительного использования IPv4
         const localIP = await getLocalIPAddress();
-        if (localIP) {
-          console.log(`[testConnection] Используем localAddress ${localIP} для IPv4`);
-        } else {
-          console.warn(`[testConnection] localAddress не получен, может использоваться IPv6`);
-        }
         testClient = new WebSocketClient(ip, port, localIP || null);
       } catch (error) {
-        console.error(`[testConnection] Ошибка при создании клиента для ${ip}:${port}:`, error);
         resolve(false);
         return;
       }
@@ -215,11 +207,9 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
     try {
       // Тестируем подключение перед сохранением (быстрая проверка)
       const port = getDefaultWebSocketPort();
-      console.log(`[ConnectionSetup] Тестирование подключения к ${trimmedIp}:${port}...`);
       const isConnected = await testConnection(trimmedIp, port);
 
       if (isConnected) {
-        console.log(`[ConnectionSetup] Тест подключения успешен, сохраняем IP и подключаемся...`);
         await saveIp(trimmedIp);
         // Останавливаем discovery перед подключением
         if (discoveryService) {
@@ -227,7 +217,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         }
         onConnect(trimmedIp);
       } else {
-        console.log(`[ConnectionSetup] Тест подключения не удался`);
         Alert.alert('Ошибка', `Не удалось подключиться к табло ${trimmedIp}:${port}\n\nПроверьте:\n- Правильность IP адреса\n- Что табло запущено\n- Что устройства в одной сети`);
         // Перезапускаем discovery если подключение не удалось
         if (discoveryService) {
@@ -235,7 +224,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         }
       }
     } catch (error) {
-      console.error('[ConnectionSetup] Ошибка при подключении:', error);
       Alert.alert('Ошибка', 'Не удалось подключиться к табло');
       // Перезапускаем discovery если подключение не удалось
       if (discoveryService) {
@@ -327,11 +315,9 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         const results = await Promise.all(
           batch.map(async (testIp) => {
             try {
-              console.log(`[Scan] Проверка ${testIp}:${port}`);
               const isConnected = await testConnection(testIp, port, 800); // 800ms на проверку
               return isConnected ? testIp : null;
             } catch (error) {
-              console.error(`[Scan] Ошибка при проверке ${testIp}:`, error);
               return null;
             }
           })
@@ -360,7 +346,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         );
       }
     } catch (error) {
-      console.error('Ошибка при сканировании сети:', error);
       Alert.alert('Ошибка', `Не удалось просканировать сеть: ${error.message || error.toString()}`);
     } finally {
       setScanning(false);
@@ -387,19 +372,8 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
     try {
       // Передаем сохраненный IP, если он есть, для дополнительных прямых запросов
       const knownIP = savedIp || ipAddress || null;
-      if (knownIP) {
-        console.log(`[ConnectionSetup] Используем сохраненный IP для прямых discovery запросов: ${knownIP}`);
-      }
 
       await discoveryService.startBroadcast((foundIp, foundPort, deviceName) => {
-        console.log(`[ConnectionSetup] ========================================`);
-        console.log(`[ConnectionSetup] ПОЛУЧЕН КОЛБЭК: ТАБЛО НАЙДЕНО!`);
-        console.log(`[ConnectionSetup] IP адрес: ${foundIp}`);
-        console.log(`[ConnectionSetup] Порт: ${foundPort}`);
-        console.log(`[ConnectionSetup] Имя устройства: ${deviceName || 'Unknown Device'}`);
-        console.log(`[ConnectionSetup] Полный адрес: ${foundIp}:${foundPort}`);
-        console.log(`[ConnectionSetup] ========================================`);
-        console.log(`[ConnectionSetup] Найдено табло: ${deviceName || 'Unknown'} на ${foundIp}:${foundPort}`);
 
         // Обновляем список найденных устройств
         const devices = discoveryService.getFoundDevices();
@@ -417,10 +391,7 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
           }, 500);
         }
       });
-
-      console.log('[ConnectionSetup] Автоматическое обнаружение запущено (контроллер ищет табло)');
     } catch (error) {
-      console.error('[ConnectionSetup] Ошибка при запуске автоматического обнаружения:', error);
       setAutoDiscovering(false);
     }
   }, [discoveryService, loading, ipAddress, savedIp]);
@@ -462,7 +433,6 @@ const ConnectionSetupScreen = ({onConnect, onCancel, discoveryService, isControl
         }
       }
     } catch (error) {
-      console.error('Ошибка при подключении:', error);
       Alert.alert('Ошибка', 'Не удалось подключиться к устройству');
       // Перезапускаем discovery если подключение не удалось
       if (discoveryService) {
